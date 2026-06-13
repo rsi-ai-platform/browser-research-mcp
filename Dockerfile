@@ -94,7 +94,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MCP_HOST=0.0.0.0 \
     PORT=7862 \
     HEADLESS=true \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
+    # Trust X-Forwarded-* headers from any IP. Cloud Run terminates TLS at
+    # its frontend and forwards the request internally; without this,
+    # uvicorn sees a plain-HTTP connection from the proxy and won't honour
+    # the original https scheme. Belt-and-suspenders with the FastMCP
+    # transport_security relaxation in __main__.py — together they make
+    # the streamable-http transport reachable through Cloud Run's edge.
+    FORWARDED_ALLOW_IPS="*"
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/browser-research /usr/local/bin/browser-research
