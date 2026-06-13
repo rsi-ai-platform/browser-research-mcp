@@ -98,29 +98,14 @@ jobs:
             --region=$REGION --project=$PROJECT_ID \
             --format='value(status.url)')
           echo "Service URL: $URL"
-          # Step 1: initialize an MCP session
-          INIT_BODY='{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1"}}}'
-          INIT_HEADERS=$(mktemp)
-          curl -fsSN -X POST "$URL/mcp" \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -D "$INIT_HEADERS" \
-            -d "$INIT_BODY" > /dev/null
-          SID=$(grep -i 'mcp-session-id' "$INIT_HEADERS" | awk '{print $2}' | tr -d '\r\n')
-          if [ -z "$SID" ]; then
-            echo "::error::no Mcp-Session-Id returned from initialize"
-            exit 1
-          fi
-          curl -fsS -X POST "$URL/mcp" \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -H "Mcp-Session-Id: $SID" \
-            -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' > /dev/null
-          # Step 2: tools/list must return visit + extract + act
+          # The server runs in stateless HTTP mode (mcp.settings.stateless_http
+          # = True in __main__.py) so initialize does NOT return an
+          # Mcp-Session-Id and subsequent calls don't carry one — that's by
+          # design and matches every other tool-only MCP in our fleet.
+          # Verify the surface directly via tools/list.
           RESP=$(curl -fsS -X POST "$URL/mcp" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
-            -H "Mcp-Session-Id: $SID" \
             -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}')
           echo "$RESP" | head -c 400
           for T in visit extract act; do
