@@ -1,0 +1,130 @@
+# Continuous deployment to Cloud Run.
+#
+# On every push to main (and on workflow_dispatch), this workflow rebuilds
+# the image, pushes it to Artifact Registry, and rolls it onto the existing
+# Cloud Run service. The service URL is stable; consumers (e.g. the
+# DeepInsights monorepo) never have to update their config.
+#
+# Auth is via Workload Identity Federation — NO long-lived service-account
+# key is stored in GitHub secrets. The setup mirrors what we did for
+# rbi-dbie-mcp (see that repo's .github/CLOUD_RUN_CD.md for the one-time
+# GCP wiring); reuse the same WIF pool by pointing the WIF_PROVIDER /
+# WIF_SA secrets at the deployer service account.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   WIF_PROVIDER   projects/<NUM>/locations/global/workloadIdentityPools/github-actions/providers/github
+#   WIF_SA         browser-research-deployer@<PROJECT>.iam.gserviceaccount.com
+#                  (the SA must have roles/run.admin + roles/artifactregistry.writer
+#                   + roles/iam.serviceAccountUser on the Cloud Run runtime SA)
+#
+# Heads-up: the Chromium download in the Dockerfile is ~92 MB; full
+# image is ~800 MB. Builds are cached via type=gha so steady-state CI
+# turn-around stays under 5 min.
+
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/CLOUD_RUN_CD.md'
+  workflow_dispatch:
+
+# Cancel an in-flight deploy when a newer commit lands.
+concurrency:
+  group: cloud-run-deploy
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: silverfox-454313
+  REGION: asia-south1
+  AR_REPO: agentic-rag
+  SERVICE: browser-research-mcp
+  IMAGE_BASE: asia-south1-docker.pkg.dev/silverfox-454313/agentic-rag/browser-research-mcp
+
+jobs:
+  deploy:
+    name: Build, push, deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for Workload Identity Federation
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy $SERVICE \
+            --image=$IMAGE_BASE:${{ github.sha }} \
+            --region=$REGION \
+            --project=$PROJECT_ID \
+            --quiet
+
+      - name: Smoke-test the deployed MCP
+        run: |
+          URL=$(gcloud run services describe $SERVICE \
+            --region=$REGION --project=$PROJECT_ID \
+            --format='value(status.url)')
+          echo "Service URL: $URL"
+          # Step 1: initialize an MCP session
+          INIT_BODY='{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1"}}}'
+          INIT_HEADERS=$(mktemp)
+          curl -fsSN -X POST "$URL/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -D "$INIT_HEADERS" \
+            -d "$INIT_BODY" > /dev/null
+          SID=$(grep -i 'mcp-session-id' "$INIT_HEADERS" | awk '{print $2}' | tr -d '\r\n')
+          if [ -z "$SID" ]; then
+            echo "::error::no Mcp-Session-Id returned from initialize"
+            exit 1
+          fi
+          curl -fsS -X POST "$URL/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H "Mcp-Session-Id: $SID" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' > /dev/null
+          # Step 2: tools/list must return visit + extract + act
+          RESP=$(curl -fsS -X POST "$URL/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H "Mcp-Session-Id: $SID" \
+            -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}')
+          echo "$RESP" | head -c 400
+          for T in visit extract act; do
+            echo "$RESP" | grep -q "\"name\":\"$T\"" \
+              || { echo "::error::tool '$T' missing from tools/list"; exit 1; }
+          done
+          echo "✓ smoke test passed (visit + extract + act present)"
