@@ -252,6 +252,7 @@ async def visit(
     screenshot: bool = True,
     full_page_screenshot: bool = False,
     text_cap: int = 30_000,
+    return_screenshot_b64: bool = False,
 ) -> dict[str, Any]:
     """Navigate to URL with a real Chromium and return its rendered state.
 
@@ -266,13 +267,21 @@ async def visit(
             (e.g. wait for ".chart svg" on a chart page).
         wait_extra_ms: Extra settle time after the wait condition fires.
         timeout_ms: Hard timeout for the whole navigation.
-        screenshot: Whether to capture a PNG screenshot. Adds ~200ms.
+        screenshot: Whether to capture a PNG screenshot internally. Even
+            when True, the base64 is NOT returned in the response by default
+            (see return_screenshot_b64) — extract() and act() use the
+            captured screenshot in-process to feed Sonnet vision.
         full_page_screenshot: If True, scroll-stitches the whole page.
         text_cap: Cap on extracted text length (innerText).
+        return_screenshot_b64: If True, echo the base64 PNG back in the
+            response. Defaults to False because a typical screenshot is
+            ~700KB-1MB and accumulating them across an agent's tool-call
+            history blows the 1M-token context window. Tools or UIs that
+            actually need the bytes (e.g. a browser-canvas pane) can opt in.
 
     Returns:
-        {url, title, domain, text, screenshot_b64?, fetched_at, current_date,
-         duration_ms}
+        {url, title, domain, text, screenshot_bytes?, screenshot_b64?,
+         fetched_at, current_date}
     """
     t0 = time.perf_counter()
     if not url:
@@ -284,7 +293,12 @@ async def visit(
     if cached := _visit_cache.get(cache_key):
         _emit("visit", t0, cache_hit=True,
                extra={"chars": len(cached.get("text") or "")})
-        return cached
+        # Strip the base64 from cache hits too unless the caller wants it.
+        # The cache keeps it because extract()/act() pull from the same
+        # cache via _sonnet_extract.
+        if return_screenshot_b64:
+            return cached
+        return {k: v for k, v in cached.items() if k != "screenshot_b64"}
 
     client_id = _current_client.get() or "anon"
     ctx = await _get_context(client_id)
@@ -332,19 +346,35 @@ async def visit(
             "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         }
 
+        # Capture the screenshot bytes internally regardless — extract() and
+        # act() depend on them for Sonnet vision. We only put the base64 into
+        # the *returned* dict if the caller asked for it; the cache keeps the
+        # full payload so an extract() call right after visit() doesn't pay
+        # twice. The agent-facing tool response gets `screenshot_bytes` so it
+        # knows a screenshot was taken without carrying the 1MB blob.
+        shot_b64: str | None = None
         if screenshot:
             try:
                 png = await page.screenshot(
                     type="png",
                     full_page=full_page_screenshot,
                 )
-                out["screenshot_b64"] = base64.b64encode(png).decode("ascii")
+                shot_b64 = base64.b64encode(png).decode("ascii")
                 out["screenshot_bytes"] = len(png)
             except Exception as e:  # noqa: BLE001
                 log.warning("screenshot failed: %s", e)
 
         if out["text"]:
-            _visit_cache[cache_key] = out
+            # Cache the full payload (including base64) so chained extract()/
+            # act() calls can use it. The base64 is stripped from the returned
+            # dict below.
+            cache_entry = dict(out)
+            if shot_b64:
+                cache_entry["screenshot_b64"] = shot_b64
+            _visit_cache[cache_key] = cache_entry
+
+        if return_screenshot_b64 and shot_b64:
+            out["screenshot_b64"] = shot_b64
 
         _emit("visit", t0,
                extra={"chars": len(out["text"]),
@@ -664,6 +694,11 @@ async def extract(
         screenshot=True,
         full_page_screenshot=full_page_screenshot,
         text_cap=20_000,
+        # We NEED the bytes for Sonnet vision — extract() always asks for them.
+        # _sonnet_extract reads `screenshot_b64`; the final response strips it
+        # back out unless the caller explicitly asked for it via
+        # include_screenshot_in_response.
+        return_screenshot_b64=True,
     )
     if "error" in visited:
         return visited

@@ -53,6 +53,7 @@ async def visit(
     screenshot: bool = True,
     full_page_screenshot: bool = False,
     text_cap: int = 30000,
+    return_screenshot_b64: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Open a URL with a real Chromium and return its rendered state.
@@ -68,12 +69,18 @@ async def visit(
             e.g. ".chart svg", "table#monthly tbody tr".
         wait_extra_ms: Extra settle time after the wait fires (default 1500).
         timeout_ms: Hard navigation timeout (default 45s).
-        screenshot: Whether to capture a PNG (default True). Adds ~200ms.
+        screenshot: Whether to capture a PNG INTERNALLY (default True). Adds
+            ~200ms; the bytes are used by extract()/act() for Sonnet vision.
         full_page_screenshot: Scroll-stitch the whole page (default False).
         text_cap: Cap on extracted text length (default 30000).
+        return_screenshot_b64: Whether to ECHO the base64 PNG back in the
+            response. DEFAULT False — typical screenshots are 700KB-1MB and
+            accumulating them across an agent's tool-call history blows the
+            1M-token context window in ~3 calls. Only opt in when the caller
+            actually consumes the bytes (e.g. a browser-canvas UI).
 
     Returns:
-        {url, title, domain, text, screenshot_b64, screenshot_bytes,
+        {url, title, domain, text, screenshot_bytes, screenshot_b64 (opt-in),
          fetched_at, current_date}
     """
     _bind(ctx)
@@ -85,6 +92,7 @@ async def visit(
         screenshot=screenshot,
         full_page_screenshot=full_page_screenshot,
         text_cap=text_cap,
+        return_screenshot_b64=return_screenshot_b64,
     )
 
 
