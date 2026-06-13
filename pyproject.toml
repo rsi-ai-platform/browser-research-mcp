@@ -1,0 +1,44 @@
+[project]
+name = "browser-research-mcp"
+version = "0.1.0"
+description = "Browser-based research MCP — drives a real Chromium via patched Playwright + Sonnet vision to read JS-rendered pages, login-walled dashboards, and dynamic dropdowns that pdf_fetch / http_post_form can't reach."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "DeepInsights" }]
+license = { text = "Apache-2.0" }
+keywords = ["mcp", "modelcontextprotocol", "playwright", "browser", "patchright"]
+
+dependencies = [
+    "mcp>=1.2",
+    "httpx>=0.27",
+    "anthropic>=0.40",
+    "pydantic>=2.9",
+    # patchright is a drop-in patched Playwright that disables the
+    # AutomationControlled flag, removes Runtime.enable leaks, and several
+    # other detection vectors. Use the async_api exactly like upstream.
+    # If patchright ever stops being maintained we can swap back to plain
+    # `playwright` by changing one import line.
+    "patchright>=1.40",
+    # In-process TTL caches — mirror the authority-web-search pattern.
+    "cachetools>=5.3",
+    # google-cloud-storage for session storage_state persistence. Optional;
+    # tools degrade gracefully to local /tmp when not configured.
+    "google-cloud-storage>=2.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.7"]
+
+[project.scripts]
+browser-research = "browser_research.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/browser_research"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

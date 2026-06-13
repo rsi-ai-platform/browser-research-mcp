@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.log
+.DS_Store
+# Playwright browser cache (~500 MB) — never commit, container reinstalls.
+.playwright-browsers/
