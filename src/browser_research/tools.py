@@ -337,6 +337,37 @@ async def visit(
         except Exception:
             text = ""
 
+        # Scan the rendered DOM for download-shaped links. We CANNOT parse
+        # these — Chromium just returns bytes and our toolkit has no Excel /
+        # CSV reader on the browser-research side. But surfacing the URLs
+        # lets the agent recommend the right tool downstream (e.g. the
+        # excel_fetch_structured tool on authority-web-search-mcp) or hand
+        # the link back to the user. Far better than the agent spinning
+        # through visit() calls on a page whose data is all in attachments.
+        file_links: list[dict[str, str]] = []
+        try:
+            file_links = await page.evaluate(r"""
+                () => {
+                  const exts = ['.xlsx','.xlsm','.xls','.csv','.tsv','.pdf','.zip','.7z','.docx','.pptx'];
+                  const seen = new Set();
+                  const out = [];
+                  for (const a of document.querySelectorAll('a[href]')) {
+                    const href = (a.href || '').trim();
+                    if (!href || seen.has(href)) continue;
+                    const path = (new URL(href, document.baseURI)).pathname.toLowerCase();
+                    const ext = exts.find(e => path.endsWith(e));
+                    if (!ext) continue;
+                    seen.add(href);
+                    const text = (a.innerText || a.textContent || '').replace(/\s+/g,' ').trim();
+                    out.push({href, text: text.slice(0, 200), format: ext.slice(1)});
+                    if (out.length >= 40) break;
+                  }
+                  return out;
+                }
+            """)
+        except Exception as e:  # noqa: BLE001
+            log.debug("file_links scan failed: %s", e)
+
         out: dict[str, Any] = {
             "url": url_final,
             "title": title[:300],
@@ -345,6 +376,13 @@ async def visit(
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         }
+        if file_links:
+            out["file_links"] = file_links
+            # Per-format counts so the agent can scan at a glance.
+            from collections import Counter
+            out["file_links_summary"] = dict(
+                Counter(fl["format"] for fl in file_links)
+            )
 
         # Capture the screenshot bytes internally regardless — extract() and
         # act() depend on them for Sonnet vision. We only put the base64 into
