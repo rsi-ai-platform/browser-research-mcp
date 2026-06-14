@@ -747,3 +747,376 @@ async def extract(
     _emit("extract", t0,
            extra={"shot_kb": round((visited.get("screenshot_bytes", 0)) / 1024)})
     return out
+
+
+# ============================================================================
+# download_file — fetch + parse spreadsheets and PDFs.
+#
+# Port of the battle-tested fetch+parse pipeline from authority-web-search.
+# One tool, format auto-detected by content-type + magic bytes, parsed by
+# openpyxl / xlrd / csv / pypdf, returns the same classified-error shape so
+# the calling model can navigate identically across both MCPs.
+#
+# This closes the loop on URLs that the Chromium-based visit/act/extract
+# tools surface as `file_links` but can't read themselves — gov-site Excel
+# bulletins (gst.gov.in, cga.nic.in, mospi.gov.in), PDF circulars (RBI,
+# SEBI), CSV data dumps (data.gov.in).
+# ============================================================================
+
+_EXCEL_DOWNLOAD_CAP_BYTES = 16 * 1024 * 1024   # 16 MB
+_PDF_DOWNLOAD_CAP_BYTES = 24 * 1024 * 1024     # 24 MB
+_EXCEL_TEXT_CAP = 80_000                       # chars
+_PDF_TEXT_CAP = 80_000                         # chars
+
+
+def _is_excel_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        u = urlparse(url.lower())
+    except Exception:
+        return False
+    for ext in (".xlsx", ".xlsm", ".xls", ".csv", ".tsv"):
+        if u.path.endswith(ext) or ext in (u.query or ""):
+            return True
+    return False
+
+
+def _is_pdf_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        u = urlparse(url.lower())
+    except Exception:
+        return False
+    return u.path.endswith(".pdf") or ".pdf" in (u.query or "")
+
+
+def _parse_excel_sync(raw_bytes: bytes, sheet: str | None,
+                       max_rows_per_sheet: int) -> dict[str, Any]:
+    import io as _io
+    sheets: list[dict[str, Any]] = []
+    fmt = "xlsx"
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"openpyxl unavailable: {e}"}
+    try:
+        wb = load_workbook(filename=_io.BytesIO(raw_bytes), read_only=True,
+                            data_only=True)
+        sheet_names = wb.sheetnames
+        targets = [sheet] if sheet and sheet in sheet_names else sheet_names
+        chunks: list[str] = []
+        total_chars = 0
+        for sn in targets:
+            ws = wb[sn]
+            rows_out: list[list[str]] = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                vals = [("" if v is None else str(v)) for v in row]
+                while vals and not vals[-1].strip():
+                    vals.pop()
+                if not vals:
+                    continue
+                rows_out.append(vals)
+                if i >= max_rows_per_sheet:
+                    break
+            header = rows_out[0] if rows_out else []
+            sample = rows_out[1:11]
+            sheets.append({
+                "name": sn,
+                "rows": len(rows_out),
+                "cols": max((len(r) for r in rows_out), default=0),
+                "header": header,
+                "sample": sample,
+            })
+            chunk = f"\n\n=== Sheet: {sn} ===\n" + "\n".join(
+                "\t".join(r) for r in rows_out
+            )
+            if total_chars + len(chunk) > _EXCEL_TEXT_CAP:
+                chunk = chunk[: _EXCEL_TEXT_CAP - total_chars]
+                chunks.append(chunk)
+                break
+            chunks.append(chunk)
+            total_chars += len(chunk)
+        return {"sheets": sheets, "content": "".join(chunks).strip(),
+                "format": fmt, "sheet_count": len(sheet_names)}
+    except Exception as e:  # noqa: BLE001
+        # Fall back to xlrd for legacy .xls before giving up.
+        try:
+            import xlrd  # type: ignore
+            book = xlrd.open_workbook(file_contents=raw_bytes)
+            chunks: list[str] = []
+            total_chars = 0
+            for s_idx in range(book.nsheets):
+                ws = book.sheet_by_index(s_idx)
+                rows_out: list[list[str]] = []
+                for i in range(ws.nrows):
+                    vals = [str(ws.cell_value(i, j)) for j in range(ws.ncols)]
+                    while vals and not vals[-1].strip():
+                        vals.pop()
+                    if not vals:
+                        continue
+                    rows_out.append(vals)
+                    if i >= max_rows_per_sheet:
+                        break
+                header = rows_out[0] if rows_out else []
+                sample = rows_out[1:11]
+                sheets.append({
+                    "name": ws.name, "rows": len(rows_out),
+                    "cols": max((len(r) for r in rows_out), default=0),
+                    "header": header, "sample": sample,
+                })
+                chunk = f"\n\n=== Sheet: {ws.name} ===\n" + "\n".join(
+                    "\t".join(r) for r in rows_out
+                )
+                if total_chars + len(chunk) > _EXCEL_TEXT_CAP:
+                    chunk = chunk[: _EXCEL_TEXT_CAP - total_chars]
+                    chunks.append(chunk)
+                    break
+                chunks.append(chunk)
+                total_chars += len(chunk)
+            return {"sheets": sheets, "content": "".join(chunks).strip(),
+                    "format": "xls", "sheet_count": book.nsheets}
+        except Exception as e2:  # noqa: BLE001
+            return {"error": f"could not open Excel: {e}; xls fallback: {e2}"}
+
+
+def _parse_csv_sync(raw_bytes: bytes, max_rows: int) -> dict[str, Any]:
+    import csv as _csv
+    text = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        dialect = _csv.Sniffer().sniff(text[:4096])
+    except Exception:
+        dialect = _csv.excel
+    reader = _csv.reader(text.splitlines(), dialect=dialect)
+    rows: list[list[str]] = []
+    for i, r in enumerate(reader):
+        rows.append([c.strip() for c in r])
+        if i >= max_rows:
+            break
+    header = rows[0] if rows else []
+    sample = rows[1:11]
+    content = "\n".join("\t".join(r) for r in rows)[: _EXCEL_TEXT_CAP]
+    return {"sheets": [{"name": "CSV", "rows": len(rows),
+                          "cols": max((len(r) for r in rows), default=0),
+                          "header": header, "sample": sample}],
+            "content": content, "format": "csv", "sheet_count": 1}
+
+
+def _parse_pdf_sync(raw_bytes: bytes, pages: list[int] | None,
+                    max_pages: int) -> dict[str, Any]:
+    import io as _io
+    try:
+        from pypdf import PdfReader
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"pypdf unavailable: {e}"}
+    try:
+        reader = PdfReader(_io.BytesIO(raw_bytes))
+        n_pages = len(reader.pages)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"could not open PDF: {e}"}
+    wanted = ([i - 1 for i in pages if 1 <= i <= n_pages] if pages
+              else list(range(min(n_pages, max_pages))))
+    chunks: list[str] = []
+    extracted: list[int] = []
+    total_chars = 0
+    truncated = False
+    for i in wanted:
+        try:
+            txt = reader.pages[i].extract_text() or ""
+        except Exception:  # noqa: BLE001
+            txt = ""
+        if not txt:
+            continue
+        chunk = f"\n\n--- Page {i + 1} ---\n{txt}"
+        if total_chars + len(chunk) > _PDF_TEXT_CAP:
+            chunk = chunk[: _PDF_TEXT_CAP - total_chars]
+            chunks.append(chunk)
+            extracted.append(i + 1)
+            truncated = True
+            break
+        chunks.append(chunk)
+        extracted.append(i + 1)
+        total_chars += len(chunk)
+    return {
+        "content": "".join(chunks).strip(),
+        "page_count": n_pages,
+        "pages_extracted": extracted,
+        "content_truncated": truncated or len(wanted) < n_pages,
+    }
+
+
+async def download_file(
+    url: str,
+    *,
+    sheet: str | None = None,
+    pages: list[int] | None = None,
+    max_rows_per_sheet: int = 200,
+    max_pdf_pages: int = 30,
+) -> dict[str, Any]:
+    """Download a URL and parse it as a spreadsheet (.xlsx/.xlsm/.xls/.csv/
+    .tsv) or PDF. Format is auto-detected via content-type + magic bytes.
+
+    Returns one of:
+      • Spreadsheet → {kind: "spreadsheet", url, domain, format,
+                       sheets[], content, sheet_count, fetched_at}
+      • PDF         → {kind: "pdf", url, domain, content, page_count,
+                       pages_extracted, content_truncated, fetched_at}
+      • Error       → {error, error_kind, url, domain, ...}
+
+    error_kind values: http_error, html_masquerade, truncated_body,
+    invalid_xlsx, parse_error, wrong_content_type, too_large.
+    """
+    t0 = time.perf_counter()
+    domain = _domain(url)
+    # Stealth-ish headers so gov-CDNs that block "python-httpx/x.y" still
+    # serve us. Same UA shape as the Playwright contexts.
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/127.0.0.0 Safari/537.36"),
+        "Accept": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, "
+                   "application/vnd.ms-excel, application/pdf, text/csv, */*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True,
+                                       headers=headers) as client:
+            r = await client.get(url)
+    except httpx.HTTPError as e:
+        out = {"error": f"download failed: {e}", "error_kind": "http_error",
+                "url": url, "domain": domain}
+        _emit("download_file", t0, extra={"err": "transport"})
+        return out
+
+    ct = (r.headers.get("content-type") or "").lower()
+    body_head = r.content[:512]
+    looks_like_html = (
+        body_head[:5].lower() in (b"<html", b"<!doc")
+        or b"<html" in body_head[:200].lower()
+    )
+
+    if r.status_code >= 400:
+        _emit("download_file", t0, extra={"err": "http", "status": r.status_code})
+        return {
+            "error": (f"HTTP {r.status_code} from server — the URL is broken "
+                       f"or you don't have access. NOT a parsing issue; pick a "
+                       f"different file."),
+            "error_kind": "http_error",
+            "http_status": r.status_code,
+            "url": url, "domain": domain,
+        }
+    if looks_like_html and not _is_pdf_url(url):
+        _emit("download_file", t0, extra={"err": "html"})
+        return {
+            "error": ("Server returned an HTML page (likely a 404 redirect "
+                       "or login wall), not a file. The URL probably "
+                       "redirected somewhere else."),
+            "error_kind": "html_masquerade",
+            "url": url, "domain": domain,
+            "body_head": body_head[:200].decode("utf-8", errors="replace"),
+        }
+    if len(r.content) < 256:
+        _emit("download_file", t0, extra={"err": "truncated"})
+        return {
+            "error": (f"Server returned only {len(r.content)} bytes — too "
+                       f"small to be a real file. The URL is almost certainly "
+                       f"broken."),
+            "error_kind": "truncated_body",
+            "url": url, "domain": domain,
+            "body_head": body_head.decode("utf-8", errors="replace"),
+        }
+
+    # Magic-byte detection: xlsx = PK (zip); xls = OLE; pdf = %PDF-.
+    is_xlsx = r.content[:2] == b"PK"
+    is_xls = r.content[:8].startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    is_pdf = (r.content[:5] == b"%PDF-"
+              or r.content[:8].lstrip().startswith(b"%PDF-"))
+    is_csv = (
+        ("csv" in ct) or url.lower().endswith(".csv")
+        or (not is_xlsx and not is_xls and not is_pdf
+            and url.lower().endswith(".tsv"))
+    )
+
+    if is_pdf or "pdf" in ct or _is_pdf_url(url):
+        if len(r.content) > _PDF_DOWNLOAD_CAP_BYTES:
+            _emit("download_file", t0, extra={"err": "too_large",
+                                                "bytes": len(r.content)})
+            return {
+                "error": (f"PDF too large ({len(r.content) // (1024*1024)} MB, "
+                           f"cap {_PDF_DOWNLOAD_CAP_BYTES // (1024*1024)} MB)"),
+                "error_kind": "too_large",
+                "url": url, "domain": domain,
+            }
+        parsed = await asyncio.to_thread(_parse_pdf_sync, r.content,
+                                           pages, max_pdf_pages)
+        if "error" in parsed:
+            _emit("download_file", t0, extra={"err": "pdf_parse"})
+            return {**parsed, "error_kind": "parse_error",
+                    "url": url, "domain": domain}
+        out = {
+            "kind": "pdf",
+            "url": url, "domain": domain,
+            "content": parsed["content"],
+            "page_count": parsed["page_count"],
+            "pages_extracted": parsed["pages_extracted"],
+            "content_truncated": parsed["content_truncated"],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _emit("download_file", t0, extra={"fmt": "pdf",
+                                            "pages": parsed["page_count"]})
+        return out
+
+    if len(r.content) > _EXCEL_DOWNLOAD_CAP_BYTES:
+        _emit("download_file", t0, extra={"err": "too_large",
+                                            "bytes": len(r.content)})
+        return {
+            "error": (f"spreadsheet too large "
+                       f"({len(r.content) // (1024*1024)} MB, cap "
+                       f"{_EXCEL_DOWNLOAD_CAP_BYTES // (1024*1024)} MB)"),
+            "error_kind": "too_large",
+            "url": url, "domain": domain,
+        }
+
+    if is_csv:
+        parsed = await asyncio.to_thread(_parse_csv_sync, r.content,
+                                           max_rows_per_sheet)
+    elif (is_xlsx or is_xls or _is_excel_url(url)
+            or "excel" in ct or "spreadsheet" in ct):
+        parsed = await asyncio.to_thread(_parse_excel_sync, r.content,
+                                           sheet, max_rows_per_sheet)
+    else:
+        _emit("download_file", t0, extra={"err": "wrong_ct", "ct": ct})
+        return {"error": f"not a supported file format (content-type: "
+                          f"{ct or 'unknown'}). download_file handles "
+                          f".xlsx/.xls/.csv/.tsv/.pdf.",
+                "error_kind": "wrong_content_type",
+                "url": url, "domain": domain}
+
+    if "error" in parsed:
+        msg = parsed["error"]
+        if "[Content_Types].xml" in msg or "Unknown ZIP file" in msg:
+            _emit("download_file", t0, extra={"err": "invalid_xlsx"})
+            return {
+                "error": ("File downloaded but is not a valid xlsx — the URL "
+                           "probably points to a corrupt or stub file. (Parse "
+                           f"error: {msg[:120]})"),
+                "error_kind": "invalid_xlsx",
+                "url": url, "domain": domain,
+            }
+        _emit("download_file", t0, extra={"err": "parse"})
+        return {**parsed, "error_kind": "parse_error",
+                "url": url, "domain": domain}
+
+    out = {
+        "kind": "spreadsheet",
+        "url": url, "domain": domain,
+        "format": parsed["format"],
+        "sheet_count": parsed["sheet_count"],
+        "sheets": parsed["sheets"],
+        "content": parsed["content"],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _emit("download_file", t0, extra={"fmt": parsed["format"],
+                                        "sheets": parsed["sheet_count"]})
+    return out

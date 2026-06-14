@@ -24,6 +24,13 @@ dependencies = [
     # google-cloud-storage for session storage_state persistence. Optional;
     # tools degrade gracefully to local /tmp when not configured.
     "google-cloud-storage>=2.10",
+    # Spreadsheet + PDF parsing for download_file(). Mirrors the toolchain
+    # in authority-web-search so a URL pointing at a .xlsx, .xls, .csv or
+    # .pdf can be downloaded and read end-to-end inside browser-research,
+    # without bouncing the caller to another MCP.
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

@@ -30,34 +30,35 @@ mcp = FastMCP(
         "TOOLS:\n"
         "  - `visit(url)`: open the page, return DOM text + screenshot. "
         "    Cheap, no LLM call.\n"
+        "  - `act(url, steps)`: click / type / select through a flow, then "
+        "    Sonnet-extract the final page. For dropdowns + dashboards.\n"
         "  - `extract(url, focus)`: visit + Sonnet structured extraction. "
         "    Returns the SAME shape as pdf_fetch_structured / "
         "    web_fetch_structured (title, dateline, summary, key_facts, "
         "    numeric_values, dates, tables_summary). Picks up numbers from "
         "    the screenshot too — useful for chart pages where the values "
-        "    are drawn, not text.\n\n"
+        "    are drawn, not text.\n"
+        "  - `download_file(url)`: download a .xlsx/.xlsm/.xls/.csv/.tsv "
+        "    or .pdf and parse it end-to-end (openpyxl / xlrd / csv / "
+        "    pypdf). Returns sheets + sample rows (spreadsheets) or page "
+        "    text (PDFs) plus a classified error_kind on failure. THIS is "
+        "    what you call on every entry in the `file_links` array that "
+        "    `visit` / `act` surface — DO NOT `visit` a file URL, it will "
+        "    just stream binary.\n\n"
         "INDIAN FISCAL YEAR: a table labelled '2025-2026' / 'FY26' spans "
         "April 2025 → March 2026 — the April…December columns are the FIRST "
         "year and Jan-March are the SECOND. Never read 'April' as the "
         "current calendar year by default.\n\n"
-        "FILE DOWNLOADS — IMPORTANT LIMITATION. This MCP only reads HTML / "
-        "JS-rendered pages; it cannot parse spreadsheets (.xlsx/.xls/.csv) "
-        "or PDFs. When `visit` or `act` returns a `file_links` field, those "
-        "are URLs to attachments on the page. Do NOT visit them again — "
-        "Chromium will just return the binary and you still won't be able "
-        "to read it. Instead:\n"
-        "  • For .xlsx / .xls / .csv → call the `excel_fetch_structured` "
-        "    tool on the authority-web-search MCP (or via the RSI Search "
-        "    Pro meta-MCP). It downloads the binary and parses it.\n"
-        "  • For .pdf → call `pdf_fetch_structured` on the same MCP.\n"
-        "  • If only this MCP is available and the data lives in a file "
-        "    attachment, return the file URL in your final answer with a "
-        "    note that the user should switch to RSI Search Pro / "
-        "    authority-web-search for spreadsheet/PDF parsing.\n"
-        "Sites that publish data ONLY as attachments (GST collections at "
+        "FILE-AS-DATA WORKFLOW. Gov sites in India often publish the actual "
+        "numbers ONLY as Excel / PDF attachments (GST at "
         "gst.gov.in/download/gststatistics, CGA monthly accounts, MoSPI "
-        "Excel press kits) will never be solvable by visit/act/extract "
-        "alone — recognise this fast and route correctly."
+        "Excel press kits, RBI circulars). For these:\n"
+        "  1. `visit` the index page to surface `file_links`.\n"
+        "  2. Pick the entry whose anchor text matches your target period.\n"
+        "  3. `download_file` on its href.\n"
+        "  4. Read the `sheets[].sample` (or PDF `content`) for the answer.\n"
+        "Do not bounce the user to another MCP for file parsing — that is "
+        "now this MCP's job too."
     ),
 )
 
@@ -212,4 +213,54 @@ async def extract(
         focus=focus,
         wait_for_selector=wait_for_selector,
         full_page_screenshot=full_page_screenshot,
+    )
+
+
+@mcp.tool()
+async def download_file(
+    url: str,
+    sheet: str | None = None,
+    pages: list[int] | None = None,
+    max_rows_per_sheet: int = 200,
+    max_pdf_pages: int = 30,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Download a file URL and parse its contents end-to-end.
+
+    Supported formats (auto-detected by content-type + magic bytes):
+        .xlsx / .xlsm   →  openpyxl, all sheets parsed
+        .xls            →  xlrd (legacy Excel)
+        .csv / .tsv     →  csv.Sniffer (handles , ; \\t)
+        .pdf            →  pypdf, text per page
+
+    Use this on every `file_links` entry that `visit` / `act` surface.
+    Sites like gst.gov.in/download/gststatistics, cga.nic.in monthly
+    accounts and mospi.gov.in press kits publish their actual numbers
+    ONLY as attachments — `visit` will just stream binary at you.
+
+    Args:
+        url: Absolute URL of the file.
+        sheet: Optional sheet name (.xlsx/.xls). Default: parse all.
+        pages: Optional 1-indexed PDF page list. Default: first N pages.
+        max_rows_per_sheet: Cap on rows per spreadsheet sheet (default 200).
+        max_pdf_pages: Cap on PDF pages parsed when `pages` is None
+            (default 30).
+
+    Returns:
+        Spreadsheet → {kind: "spreadsheet", url, domain, format,
+            sheet_count, sheets[{name, rows, cols, header, sample}],
+            content, fetched_at}.
+        PDF → {kind: "pdf", url, domain, content, page_count,
+            pages_extracted, content_truncated, fetched_at}.
+        Error → {error, error_kind, url, domain, …}.
+        error_kind ∈ {http_error, html_masquerade, truncated_body,
+            invalid_xlsx, parse_error, wrong_content_type, too_large}.
+    """
+    _bind(ctx)
+    return await tools.download_file(
+        url,
+        sheet=sheet,
+        pages=pages,
+        max_rows_per_sheet=max_rows_per_sheet,
+        max_pdf_pages=max_pdf_pages,
     )
