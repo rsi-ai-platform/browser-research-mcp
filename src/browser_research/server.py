@@ -173,8 +173,23 @@ async def today() -> dict[str, Any]:
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     ist = _tz(_td(hours=5, minutes=30))
     now = _dt.now(ist)
-    fy_start = now.year if now.month >= 4 else now.year - 1
-    fy_end = fy_start + 1
+    current_fy_start = now.year if now.month >= 4 else now.year - 1
+    current_fy_end = current_fy_start + 1
+    fy_months_elapsed = now.month - 3 if now.month >= 4 else now.month + 9
+    fy_quarter_in = (fy_months_elapsed - 1) // 3 + 1
+    last_completed_fy_start = current_fy_start - 1
+
+    def _fy_label(start: int) -> str:
+        return f"FY{str(start + 1)[-2:]}"
+
+    last_3 = [_fy_label(last_completed_fy_start - 2),
+               _fy_label(last_completed_fy_start - 1),
+               _fy_label(last_completed_fy_start)]
+    last_3_ranges = [
+        f"{last_completed_fy_start - 2}-04-01 → {last_completed_fy_start - 1}-03-31",
+        f"{last_completed_fy_start - 1}-04-01 → {last_completed_fy_start}-03-31",
+        f"{last_completed_fy_start}-04-01 → {last_completed_fy_start + 1}-03-31",
+    ]
     return {
         "iso_date": now.strftime("%Y-%m-%d"),
         "iso_datetime": now.isoformat(),
@@ -183,14 +198,23 @@ async def today() -> dict[str, Any]:
         "month_num": now.month,
         "day": now.day,
         "weekday": now.strftime("%A"),
-        "quarter": f"Q{(now.month - 1) // 3 + 1}",
-        "financial_year_in": f"FY{str(fy_end)[-2:]}",
-        "fy_label": f"{fy_start}-{fy_end}",
+        "calendar_quarter": f"Q{(now.month - 1) // 3 + 1}",
         "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+        "financial_year_in": _fy_label(current_fy_start),
+        "fy_label": f"{current_fy_start}-{current_fy_end}",
+        "fy_quarter_in": f"Q{fy_quarter_in}",
+        "fy_month_in": fy_months_elapsed,
+        "fy_status": "in-progress",
+        "last_completed_fy_in": _fy_label(last_completed_fy_start),
+        "last_3_completed_fys_in": last_3,
+        "last_3_completed_fy_ranges": last_3_ranges,
         "note": (
-            "FY in India is April→March. Use iso_date as the anchor for "
-            "every relative temporal phrase. Pass concrete dates derived "
-            "from this date to visit/act/extract/download_file."
+            "Indian FY runs April→March. CRITICAL FOR 'LAST N YEARS' "
+            "QUERIES: financial_year_in above is IN PROGRESS — do NOT "
+            "include it in 'last N completed years'. 'Last 3 years' → "
+            "last_3_completed_fys_in. Use iso_date + fy_quarter_in + "
+            "fy_month_in to ALSO fetch partial data for the in-progress "
+            "FY when relevant."
         ),
     }
 
