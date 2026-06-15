@@ -369,6 +369,37 @@ def _looks_blocked(title: str, text: str) -> str | None:
     return None
 
 
+# Login/registration gates on a *download or data view*. Distinct from a bot
+# wall: no fetch-fallback gets you past auth, so the right move is to pivot to
+# an open source (which the domain's playbook surfaces). Phrases are specific
+# enough that an ordinary "Log in" nav link won't trip them.
+_AUTHWALL_MARKERS = (
+    "register with us to download",
+    "register to download",
+    "please register to",
+    "login to download",
+    "log in to download",
+    "sign in to download",
+    "login to access",
+    "log in to access",
+    "please log in to view",
+    "subscription required",
+    "subscribe to download",
+    "members only",
+    "registered users only",
+)
+
+
+def _looks_authwalled(text: str) -> str | None:
+    """Return a reason if the page gates its data/download behind login or
+    registration, else None."""
+    low = (text or "").lower()
+    for m in _AUTHWALL_MARKERS:
+        if m in low:
+            return f"auth_wall:{m}"
+    return None
+
+
 def _field(obj: Any, key: str, default: Any = None) -> Any:
     """Read `key` from an SDK object or a plain dict — web_fetch result blocks
     surface as either depending on the installed anthropic SDK version."""
@@ -665,6 +696,11 @@ async def visit(
             # Fallbacks were unavailable or also failed; surface the block so
             # the agent treats this as a wall rather than empty content.
             out["blocked"] = block_reason
+        auth_wall = _looks_authwalled(text)
+        if auth_wall:
+            # Login/registration gate — no fetch-fallback helps; the matched
+            # playbook (attached at the server layer) points to an open source.
+            out["auth_wall"] = auth_wall
         if file_links:
             out["file_links"] = file_links
             # Per-format counts so the agent can scan at a glance.
@@ -875,6 +911,9 @@ async def act(
         out["final_url"] = final_url
         if block_reason:
             out["blocked"] = block_reason
+        auth_wall = _looks_authwalled(text)
+        if auth_wall:
+            out["auth_wall"] = auth_wall
         if include_screenshot_in_response and shot_b64:
             out["screenshot_b64"] = shot_b64
         _emit("act", t0,
