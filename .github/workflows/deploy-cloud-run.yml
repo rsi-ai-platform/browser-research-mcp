@@ -43,6 +43,13 @@ env:
   AR_REPO: agentic-rag
   SERVICE: browser-research-mcp
   IMAGE_BASE: asia-south1-docker.pkg.dev/silverfox-454313/agentic-rag/browser-research-mcp
+  # Runtime config pinned here so it's reproducible in-repo. (`gcloud run deploy`
+  # otherwise just preserves whatever was last set on the service by hand.)
+  RUN_MEMORY: 2Gi
+  RUN_EXEC_ENV: gen2
+  # Secret Manager secret name backing the TAVILY_API_KEY env var (the Tavily
+  # fetch fallback). See the deploy step for the one-time setup it requires.
+  TAVILY_SECRET: tavily-api-key
 
 jobs:
   deploy:
@@ -85,11 +92,29 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy to Cloud Run
+        # ONE-TIME prerequisites — without these this step FAILS, because Cloud
+        # Run validates the secret + runtime-SA access at deploy time:
+        #   printf %s "<tavily key>" | gcloud secrets create $TAVILY_SECRET \
+        #     --data-file=- --replication-policy=automatic --project=$PROJECT_ID
+        #   RUNTIME_SA=$(gcloud run services describe $SERVICE --region=$REGION \
+        #     --project=$PROJECT_ID \
+        #     --format='value(spec.template.spec.serviceAccountName)')
+        #   gcloud secrets add-iam-policy-binding $TAVILY_SECRET \
+        #     --member="serviceAccount:$RUNTIME_SA" \
+        #     --role=roles/secretmanager.secretAccessor --project=$PROJECT_ID
+        # Notes: --update-secrets (not --set-secrets) leaves ANTHROPIC_API_KEY and
+        # any other secrets untouched. --memory pins to $RUN_MEMORY (raise if you
+        # run high concurrency). --execution-environment=gen2 is the reliable tier
+        # for headless Chromium. Unspecified settings (CPU, env vars) are
+        # preserved from the current revision.
         run: |
           gcloud run deploy $SERVICE \
             --image=$IMAGE_BASE:${{ github.sha }} \
             --region=$REGION \
             --project=$PROJECT_ID \
+            --execution-environment=$RUN_EXEC_ENV \
+            --memory=$RUN_MEMORY \
+            --update-secrets=TAVILY_API_KEY=$TAVILY_SECRET:latest \
             --quiet
 
       - name: Smoke-test the deployed MCP
