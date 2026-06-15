@@ -5,16 +5,34 @@
 """
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import tools
+from . import playbooks, tools
+
+log = logging.getLogger("browser_research")
 
 
 def _bind(ctx: Context | None) -> None:
     cid = getattr(ctx, "client_id", None) if ctx is not None else None
     tools.set_current_client(cid)
+
+
+async def _attach_playbook(result: dict[str, Any], url: str) -> dict[str, Any]:
+    """If `url` matches a domain playbook, ride the recipe along in the result
+    so the agent gets it on its FIRST call — no exploration. Best-effort: a
+    playbook lookup must never break a tool call."""
+    try:
+        if isinstance(result, dict):
+            pb = await playbooks.match_for_url(url)
+            if pb:
+                result.setdefault("playbook", playbooks.for_agent(pb))
+    except Exception as e:  # noqa: BLE001
+        log.debug("playbook attach failed: %s", e)
+    return result
 
 
 mcp = FastMCP(
@@ -58,7 +76,14 @@ mcp = FastMCP(
         "  3. `download_file` on its href.\n"
         "  4. Read the `sheets[].sample` (or PDF `content`) for the answer.\n"
         "Do not bounce the user to another MCP for file parsing — that is "
-        "now this MCP's job too."
+        "now this MCP's job too.\n\n"
+        "PLAYBOOKS: a tool result may include a `playbook` field — a verified "
+        "recipe for that exact site: what to AVOID, the open-data source to "
+        "use instead, or the known-good `act` steps. When present, FOLLOW IT "
+        "before any exploration — it exists because the site was solved once "
+        "already. Also watch for `blocked` (CDN bot-wall) and `auth_wall` "
+        "(login/registration gate) flags: both mean STOP driving the page and "
+        "pivot to the playbook's open-data source."
     ),
 )
 
@@ -103,7 +128,7 @@ async def visit(
          fetched_at, current_date}
     """
     _bind(ctx)
-    return await tools.visit(
+    result = await tools.visit(
         url,
         wait_for_selector=wait_for_selector,
         wait_extra_ms=wait_extra_ms,
@@ -113,6 +138,7 @@ async def visit(
         text_cap=text_cap,
         return_screenshot_b64=return_screenshot_b64,
     )
+    return await _attach_playbook(result, url)
 
 
 @mcp.tool()
@@ -173,12 +199,13 @@ async def act(
          final_url, kind: "browser"}.
     """
     _bind(ctx)
-    return await tools.act(
+    result = await tools.act(
         url, steps,
         focus=focus,
         timeout_ms=timeout_ms,
         full_page_screenshot=full_page_screenshot,
     )
+    return await _attach_playbook(result, url)
 
 
 @mcp.tool()
@@ -208,12 +235,13 @@ async def extract(
          dates[], tables_summary[], kind: "browser"}.
     """
     _bind(ctx)
-    return await tools.extract(
+    result = await tools.extract(
         url,
         focus=focus,
         wait_for_selector=wait_for_selector,
         full_page_screenshot=full_page_screenshot,
     )
+    return await _attach_playbook(result, url)
 
 
 @mcp.tool()
@@ -257,10 +285,87 @@ async def download_file(
             invalid_xlsx, parse_error, wrong_content_type, too_large}.
     """
     _bind(ctx)
-    return await tools.download_file(
+    result = await tools.download_file(
         url,
         sheet=sheet,
         pages=pages,
         max_rows_per_sheet=max_rows_per_sheet,
         max_pdf_pages=max_pdf_pages,
     )
+    return await _attach_playbook(result, url)
+
+
+# ============================================================================
+# Admin API — read/edit playbooks WITHOUT a redeploy (the platform's admin-
+# settings UI calls these). Token-gated via ADMIN_TOKEN, fail-closed if unset.
+# Routes exist only on HTTP transports and only if this FastMCP build supports
+# custom_route; otherwise edit the GCS object directly (still hot-reloaded).
+# Recommended: have the platform BACKEND proxy these server-to-server so the
+# admin token never reaches the browser and no CORS is needed.
+# ============================================================================
+
+if hasattr(mcp, "custom_route"):
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    def _admin_ok(request: Request) -> bool:
+        token = os.environ.get("ADMIN_TOKEN")
+        return bool(token) and request.headers.get("X-Admin-Token") == token
+
+    @mcp.custom_route("/admin/playbooks", methods=["GET"])
+    async def _admin_get_playbooks(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return JSONResponse({
+            "playbooks": await playbooks.get_playbooks(force=True),
+            "source": playbooks.current_source(),
+        })
+
+    @mcp.custom_route("/admin/playbooks", methods=["PUT"])
+    async def _admin_put_playbooks(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        entries = body.get("playbooks") if isinstance(body, dict) else body
+        ok, err = playbooks.validate_playbooks(entries)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=422)
+        try:
+            await playbooks.save_playbooks(entries)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": f"save failed: {e}"}, status_code=502)
+        return JSONResponse({"ok": True, "count": len(entries)})
+
+    @mcp.custom_route("/admin/playbooks/validate", methods=["POST"])
+    async def _admin_validate(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        entries = body.get("playbooks") if isinstance(body, dict) else body
+        ok, err = playbooks.validate_playbooks(entries)
+        return JSONResponse({"ok": ok, "error": err})
+
+    @mcp.custom_route("/admin/playbooks/match", methods=["GET"])
+    async def _admin_match(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        url = request.query_params.get("url", "")
+        return JSONResponse({"url": url,
+                             "match": await playbooks.match_for_url(url)})
+
+    @mcp.custom_route("/admin/playbooks/reload", methods=["POST"])
+    async def _admin_reload(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        data = await playbooks.get_playbooks(force=True)
+        return JSONResponse({"ok": True, "count": len(data),
+                             "source": playbooks.current_source()})
+else:  # pragma: no cover - depends on installed mcp SDK version
+    log.warning("FastMCP build lacks custom_route — playbook admin API "
+                "disabled; edit the GCS object directly (still hot-reloaded).")
