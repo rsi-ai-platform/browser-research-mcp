@@ -324,7 +324,11 @@ async def save_playbooks(entries: list[dict[str, Any]]) -> None:
     if not ok:
         raise ValueError(err)
     await asyncio.to_thread(_save_to_gcs_sync, entries)
-    _cache.update(ts=time.time(), data=entries, source="gcs")
+    # Cache the MERGED effective list (not the raw overlay) so this instance
+    # keeps serving code-default-only playbooks immediately after a save.
+    _cache.update(ts=time.time(),
+                  data=_merge_playbooks(DEFAULT_PLAYBOOKS, entries),
+                  source="gcs")
 
 
 def validate_playbooks(obj: Any) -> tuple[bool, str]:
