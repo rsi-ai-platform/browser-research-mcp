@@ -16,7 +16,52 @@ web_search → web_fetch → pdf_fetch → http_post_form → browser-research
 | Tool | Purpose |
 |---|---|
 | `visit(url, …)` | Open a URL with Chromium, return DOM text + screenshot. Cheap, no LLM call. |
+| `act(url, steps, …)` | Drive clicks/fills/selects/`fetch_json` through a flow, then Sonnet-extract. Auto-captures the page's XHR/fetch → `observed_api` + a `recovery_hint` when a UI step fails. |
 | `extract(url, focus, …)` | `visit` + Sonnet structured extraction. Same response shape as `pdf_fetch_structured`. Sends the screenshot to Sonnet so chart values drawn via canvas/SVG get picked up. |
+| `download_file(url, …)` | Download + parse a `.xlsx/.xlsm/.xls/.csv/.tsv/.pdf` end-to-end. |
+| `inspect_network(url, steps?, …)` | **Discover** the AJAX endpoint(s) a JS dashboard fires — method, params, response sample. |
+| `call_api(url, method, body, …)` | **Replay** a data endpoint directly from the page's own origin. Reaches data the UI never exposes. |
+| `strategy()` | Return the decision procedure — escalation ladder + signal→action table + principles. |
+
+### Adaptiveness, built in
+
+The method isn't left to a doc the agent might skip — it's encoded three ways
+(`strategy.py`):
+
+- **Always-loaded instructions** carry a compact APPROACH ladder: classify the
+  page, take the cheapest rung that works (static fetch → `visit` → `act` →
+  `inspect_network`/`call_api` → `download_file` → pivot), and escalate on a
+  *specific signal* rather than retrying what just failed.
+- **A per-result advisor** (`diagnose_next`) rides along on every browser-tool
+  result as a `next_step` field, naming the recommended move from the signals it
+  saw — `auth_wall` → use open data; `blocked` → pivot/clean IP;
+  `observed_api`/`recovery_hint` → `call_api`; `file_links` → `download_file`;
+  sparse DOM → re-`visit`/`inspect_network`.
+- **The `strategy` tool** returns the full ladder + signal table on demand.
+
+Core principles baked in: look before you assert, probe before you build (verify
+params on a known period first), prefer API JSON over DOM over OCR, verify totals,
+then cache the win as a playbook.
+
+### API replay — the sharp edge for JS dashboards
+
+Most government dashboards (PPAC, RBI, NSE, MoSPI) render their tables from an
+AJAX endpoint, fronted by a custom JS dropdown that ordinary
+click/`select_option` automation can't drive. Rather than fight the widget,
+discover and replay the endpoint:
+
+```
+inspect_network(url, steps=[change the year dropdown])   # → endpoint + params
+        ↓
+call_api(endpoint, method="POST", body={...templated for the period...})  # → JSON
+        ↓
+save it as a playbook `api` recipe so the discovery step is skipped next time
+```
+
+`call_api` runs `fetch()` *inside* a page on the endpoint's origin, so cookies,
+CSRF state and `Origin`/`Referer` all match — and it routinely returns periods
+the dropdown omits (e.g. PPAC natural-gas FY2023-24, which isn't selectable in
+the UI but the endpoint still serves).
 
 ## Why patchright
 
@@ -98,11 +143,15 @@ static fetch with a `degraded` note.
 ### Playbooks (per-domain recipes)
 
 Hard sites get solved once, then the knowledge is cached as a **playbook** so the
-agent never re-explores. When `visit`/`act`/`extract`/`download_file` hits a URL
-matching a playbook, the result carries a `playbook` field — `strategy`, what to
-`avoid` (with the reason), an `open_data` source to use instead, and/or the
-known-good `act_steps`. The agent is told (in the server instructions) to follow
-it before exploring. Two reactive flags compose with it: `blocked` (CDN bot-wall)
+agent never re-explores. When `visit`/`act`/`extract`/`download_file`/
+`inspect_network`/`call_api` hits a URL matching a playbook, the result carries a
+`playbook` field — `strategy`, what to `avoid` (with the reason), an `open_data`
+source to use instead, the known-good `act_steps`, and/or an `api` recipe (a
+discovered endpoint + param template to replay with `call_api`). The agent is
+told (in the server instructions) to follow it before exploring. The seeded PPAC
+entries ship with verified `api` recipes (`getGasConsumption`,
+`getConsumptionPetroleumProductsData`) so those dashboards are a single
+`call_api` away. Two reactive flags compose with it: `blocked` (CDN bot-wall)
 and `auth_wall` (login/registration gate) → both mean "stop driving the page,
 use the playbook's open source."
 

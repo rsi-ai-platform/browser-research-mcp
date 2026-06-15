@@ -11,7 +11,9 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+# Aliased: the `strategy` MCP tool below would otherwise shadow this module.
 from . import playbooks, tools
+from . import strategy as strategy_module
 
 log = logging.getLogger("browser_research")
 
@@ -21,10 +23,24 @@ def _bind(ctx: Context | None) -> None:
     tools.set_current_client(cid)
 
 
-async def _attach_playbook(result: dict[str, Any], url: str) -> dict[str, Any]:
+def _attach_next_step(result: dict[str, Any], tool: str) -> dict[str, Any]:
+    """Ride the adaptive advisor along with the data: name the recommended next
+    rung from the signals in `result`. Best-effort — never break a tool call."""
+    try:
+        if isinstance(result, dict) and "next_step" not in result:
+            ns = strategy_module.diagnose_next(result, tool)
+            if ns:
+                result["next_step"] = ns
+    except Exception as e:  # noqa: BLE001
+        log.debug("next_step attach failed: %s", e)
+    return result
+
+
+async def _attach_playbook(result: dict[str, Any], url: str,
+                           tool: str = "") -> dict[str, Any]:
     """If `url` matches a domain playbook, ride the recipe along in the result
-    so the agent gets it on its FIRST call — no exploration. Best-effort: a
-    playbook lookup must never break a tool call."""
+    so the agent gets it on its FIRST call — no exploration. Also attach the
+    `next_step` advisor. Best-effort: neither lookup may break a tool call."""
     try:
         if isinstance(result, dict):
             pb = await playbooks.match_for_url(url)
@@ -32,6 +48,8 @@ async def _attach_playbook(result: dict[str, Any], url: str) -> dict[str, Any]:
                 result.setdefault("playbook", playbooks.for_agent(pb))
     except Exception as e:  # noqa: BLE001
         log.debug("playbook attach failed: %s", e)
+    if tool:
+        _attach_next_step(result, tool)
     return result
 
 
@@ -62,7 +80,27 @@ mcp = FastMCP(
         "    text (PDFs) plus a classified error_kind on failure. THIS is "
         "    what you call on every entry in the `file_links` array that "
         "    `visit` / `act` surface — DO NOT `visit` a file URL, it will "
-        "    just stream binary.\n\n"
+        "    just stream binary.\n"
+        "  - `inspect_network(url, steps?)`: open the page (optionally running "
+        "    act-style steps) and report the XHR/fetch calls it fires — "
+        "    endpoint, method, request params, response sample. The DISCOVERY "
+        "    step for JS dashboards.\n"
+        "  - `call_api(url, method, body)`: replay a data endpoint directly "
+        "    from the page's own origin (cookies / CSRF / referer all match). "
+        "    The REPLAY step — reaches data the UI never exposes.\n\n"
+        "API-REPLAY PATTERN — your sharpest tool for JS-dropdown dashboards "
+        "(PPAC, RBI, NSE, MoSPI). When a Year/Month/State selector is a custom "
+        "JS widget (so `act`'s select/click time out) the table is really fed "
+        "by an AJAX endpoint. Instead of fighting the widget:\n"
+        "  1. `inspect_network(url, steps=[change the dropdown])` → see the "
+        "endpoint + its params.\n"
+        "  2. `call_api(endpoint, method, body=<params templated for the period "
+        "you want>)` → get the JSON directly. This routinely reaches periods "
+        "the dropdown omits (e.g. an older fiscal year).\n"
+        "  3. If a playbook carries an `api` recipe, skip step 1 — call_api the "
+        "endpoint straight away. `act` also auto-captures: when a UI step fails "
+        "it returns `observed_api` + a `recovery_hint` naming the endpoint to "
+        "replay.\n\n"
         "INDIAN FISCAL YEAR: a table labelled '2025-2026' / 'FY26' spans "
         "April 2025 → March 2026 — the April…December columns are the FIRST "
         "year and Jan-March are the SECOND. Never read 'April' as the "
@@ -79,11 +117,13 @@ mcp = FastMCP(
         "now this MCP's job too.\n\n"
         "PLAYBOOKS: a tool result may include a `playbook` field — a verified "
         "recipe for that exact site: what to AVOID, the open-data source to "
-        "use instead, or the known-good `act` steps. When present, FOLLOW IT "
+        "use instead, the known-good `act` steps, or an `api` endpoint to "
+        "replay with call_api. When present, FOLLOW IT "
         "before any exploration — it exists because the site was solved once "
         "already. Also watch for `blocked` (CDN bot-wall) and `auth_wall` "
         "(login/registration gate) flags: both mean STOP driving the page and "
-        "pivot to the playbook's open-data source."
+        "pivot to the playbook's open-data source.\n\n"
+        + strategy_module.STRATEGY_INSTRUCTIONS
     ),
 )
 
@@ -120,6 +160,23 @@ async def today() -> dict[str, Any]:
             "from this date to visit/act/extract/download_file."
         ),
     }
+
+
+@mcp.tool()
+async def strategy() -> dict[str, Any]:
+    """Return the browser-research DECISION PROCEDURE — the escalation ladder
+    (static fetch → visit → act → inspect_network/call_api → download_file →
+    pivot), the signal→action table (what `blocked`, `auth_wall`, `file_links`,
+    `observed_api`, a timed-out select, etc. each mean and what to do), and the
+    core principles (look before you assert, probe before you build, prefer API
+    over DOM over OCR, escalate on the signal instead of thrashing, verify, then
+    cache the win as a playbook).
+
+    Call this when you're unsure how to approach a page, when a tool result's
+    `next_step` advisor points here, or to ground a multi-step plan. It's the
+    same method that turns a brittle JS dropdown into a one-shot API call.
+    """
+    return strategy_module.RESEARCH_STRATEGY
 
 
 @mcp.tool()
@@ -172,7 +229,7 @@ async def visit(
         text_cap=text_cap,
         return_screenshot_b64=return_screenshot_b64,
     )
-    return await _attach_playbook(result, url)
+    return await _attach_playbook(result, url, tool="visit")
 
 
 @mcp.tool()
@@ -203,6 +260,9 @@ async def act(
         {"wait_ms": 1500}
         {"goto":   "https://…"}     // mid-flow navigation
         {"screenshot": {"name": "after-select"}}    // logged, not returned
+        {"fetch_json": {"url": "…", "method": "POST", "body": "a=b&c=d"}}
+                                    // in-page fetch from the page's origin;
+                                    // result lands in `fetch_results`
 
     Example — pull PPAC FY2024-25 monthly consumption (a flow that needs
     the year dropdown change to fire an AJAX request):
@@ -217,8 +277,15 @@ async def act(
           focus="FY2024-25 monthly LPG, MS, HSD, ATF consumption",
         )
 
+    ADAPTIVE: `act` records the page's XHR/fetch while it runs. The result
+    carries `observed_api` (the data endpoints the page hit, with params), and
+    if a UI step fails on a non-native widget it adds a `recovery_hint` naming
+    the endpoint to replay with `call_api` — so a timed-out dropdown becomes a
+    one-shot API call instead of a dead end.
+
     Returns the same shape as `extract` PLUS `step_results` (per-step
-    timing + ok/error) and `final_url`.
+    timing + ok/error), `final_url`, `observed_api`, optional `recovery_hint`,
+    and `fetch_results` (from any fetch_json steps).
 
     Args:
         url: Starting page URL.
@@ -239,7 +306,7 @@ async def act(
         timeout_ms=timeout_ms,
         full_page_screenshot=full_page_screenshot,
     )
-    return await _attach_playbook(result, url)
+    return await _attach_playbook(result, url, tool="act")
 
 
 @mcp.tool()
@@ -275,7 +342,7 @@ async def extract(
         wait_for_selector=wait_for_selector,
         full_page_screenshot=full_page_screenshot,
     )
-    return await _attach_playbook(result, url)
+    return await _attach_playbook(result, url, tool="extract")
 
 
 @mcp.tool()
@@ -326,7 +393,97 @@ async def download_file(
         max_rows_per_sheet=max_rows_per_sheet,
         max_pdf_pages=max_pdf_pages,
     )
-    return await _attach_playbook(result, url)
+    return await _attach_playbook(result, url, tool="download_file")
+
+
+@mcp.tool()
+async def inspect_network(
+    url: str,
+    steps: list[dict[str, Any]] | None = None,
+    settle_ms: int = 2500,
+    url_filter: str | None = None,
+    timeout_ms: int = 60000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Open a page and report the XHR/fetch (AJAX) calls it fires — the
+    DISCOVERY half of the API-replay pattern.
+
+    Most JS dashboards (PPAC, RBI, NSE, MoSPI) render their tables/charts from
+    an AJAX endpoint. When the on-page Year/Month/State selector is a custom JS
+    widget, `act`'s select/click can't drive it — but the endpoint behind it is
+    plain HTTP. Run this to learn that endpoint and its parameters, then pull
+    the data with `call_api` (templating the params for any period you want,
+    including ones the dropdown never lists).
+
+    Pass `steps` (the same vocabulary as `act`) to capture the request a
+    specific interaction fires — e.g. change the year dropdown and read the
+    AJAX call it triggers.
+
+    Args:
+        url: Page to open.
+        steps: Optional act-style steps to run while recording (e.g.
+            [{"select": {"selector": "#year", "value": "2024-2025"}}]).
+        settle_ms: Extra wait after load/steps so late XHRs are captured.
+        url_filter: Only return requests whose URL contains this substring
+            (e.g. "Ajax", "/api/").
+        timeout_ms: Navigation/step timeout.
+
+    Returns:
+        {url, final_url, request_count, requests: [{method, url,
+         resource_type, status, content_type, request_params,
+         response_sample, ...}], step_results?}
+    """
+    _bind(ctx)
+    result = await tools.inspect_network(
+        url, steps=steps, settle_ms=settle_ms, url_filter=url_filter,
+        timeout_ms=timeout_ms,
+    )
+    return await _attach_playbook(result, url, tool="inspect_network")
+
+
+@mcp.tool()
+async def call_api(
+    url: str,
+    method: str = "GET",
+    body: Any = None,
+    headers: dict[str, str] | None = None,
+    page_url: str | None = None,
+    content_type: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Replay an API/AJAX endpoint directly — the REPLAY half of the pattern.
+
+    Loads a page on the endpoint's origin first (so cookies, CSRF state and
+    Origin/Referer match), then issues the request via in-page fetch(). This
+    bypasses brittle dropdown widgets entirely and reliably reaches data the
+    front-end never surfaces — e.g. a fiscal year missing from a selector.
+
+    Discover the endpoint + params with `inspect_network` first, or read them
+    from a matched playbook's `api` recipe.
+
+    Args:
+        url: The endpoint URL (absolute).
+        method: HTTP method. Default GET.
+        body: Request body — a dict (form-encoded by default; sent as JSON if
+            content_type is application/json) or a pre-encoded string. Example
+            (PPAC gas): {"financialYear": "2023-2024", "reportBy": "4",
+            "pageId": "138"}.
+        headers: Extra request headers, merged over the XHR defaults
+            (X-Requested-With + the right Content-Type).
+        page_url: Origin page to load before fetching. Defaults to the
+            endpoint's scheme://host/. Set to the real dashboard URL if the
+            endpoint validates Referer.
+        content_type: Override the request Content-Type.
+
+    Returns:
+        {url, page_url, status, ok, content_type, json|text,
+         source: "browser_api"}.
+    """
+    _bind(ctx)
+    return await tools.call_api(
+        url, method=method, body=body, headers=headers, page_url=page_url,
+        content_type=content_type,
+    )
 
 
 # ============================================================================

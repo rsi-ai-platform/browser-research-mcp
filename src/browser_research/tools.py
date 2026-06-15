@@ -42,7 +42,10 @@ _browser: Browser | None = None
 # Set only when BROWSER_ENGINE=camoufox — the AsyncCamoufox context manager that
 # owns the Firefox process + its own Playwright instance (closed in shutdown()).
 _camoufox_mgr: Any | None = None
-_contexts: dict[str, BrowserContext] = {}
+# Keyed by (client_id, proxied) so a direct context and a proxy-routed context
+# coexist per tenant — most sites use the direct one; only playbook-flagged /
+# explicitly-requested domains pay for the proxy.
+_contexts: dict[tuple[str, bool], BrowserContext] = {}
 _browser_lock = asyncio.Lock()
 
 _anthropic_client: Any | None = None
@@ -74,6 +77,44 @@ def _anthropic_model() -> str:
 
 def _tavily_key() -> str | None:
     return os.environ.get("TAVILY_API_KEY") or None
+
+
+def _proxy_opts() -> dict[str, str] | None:
+    """Playwright proxy dict from env, or None when unconfigured. The egress IP
+    is the dominant block signal for enterprise CDNs (Akamai et al.) — a
+    residential/ISP proxy is what actually clears them. Set BROWSER_PROXY_SERVER
+    (e.g. http://gw.proxy.net:7000) plus optional BROWSER_PROXY_USERNAME /
+    BROWSER_PROXY_PASSWORD; tools only route through it when use_proxy is on
+    (explicitly or via a playbook `proxy` hint)."""
+    server = os.environ.get("BROWSER_PROXY_SERVER")
+    if not server:
+        return None
+    opts: dict[str, str] = {"server": server}
+    user = os.environ.get("BROWSER_PROXY_USERNAME")
+    pw = os.environ.get("BROWSER_PROXY_PASSWORD")
+    if user:
+        opts["username"] = user
+    if pw:
+        opts["password"] = pw
+    return opts
+
+
+def _httpx_proxy_url() -> str | None:
+    """The same proxy as a single URL for httpx (download_file). Embeds auth
+    when set. Returns None when no proxy is configured."""
+    server = os.environ.get("BROWSER_PROXY_SERVER")
+    if not server:
+        return None
+    user = os.environ.get("BROWSER_PROXY_USERNAME")
+    pw = os.environ.get("BROWSER_PROXY_PASSWORD")
+    if user and "://" in server:
+        scheme, rest = server.split("://", 1)
+        from urllib.parse import quote
+        cred = quote(user, safe="")
+        if pw:
+            cred += ":" + quote(pw, safe="")
+        return f"{scheme}://{cred}@{rest}"
+    return server
 
 
 def _browser_engine() -> str:
@@ -168,16 +209,23 @@ async def _launch_camoufox() -> Browser:
     return browser
 
 
-async def _get_context(client_id: str) -> BrowserContext:
-    if client_id in _contexts:
-        ctx = _contexts[client_id]
+async def _get_context(client_id: str, proxied: bool = False) -> BrowserContext:
+    # A proxy was requested but none is configured → fall back to the direct
+    # context (the request still goes out, just not via a proxy) so a stale
+    # playbook `proxy` hint can never hard-fail a fetch.
+    proxy = _proxy_opts() if proxied else None
+    if proxied and proxy is None:
+        proxied = False
+    key = (client_id, proxied)
+    if key in _contexts:
+        ctx = _contexts[key]
         try:
             # Cheap liveness probe — accessing .pages on a closed context
             # raises, which is the signal to recreate it.
             _ = len(ctx.pages)
             return ctx
         except Exception:
-            _contexts.pop(client_id, None)
+            _contexts.pop(key, None)
     browser = await _get_browser()
     # India-default geo / language so JS that branches on locale (PPAC, RBI
     # dashboards) renders the Indian build.
@@ -187,6 +235,10 @@ async def _get_context(client_id: str) -> BrowserContext:
         "viewport": {"width": 1440, "height": 900},
         "accept_downloads": False,
     }
+    if proxy is not None:
+        ctx_opts["proxy"] = proxy
+        log.info("context for %s routed via proxy %s", client_id,
+                 proxy.get("server"))
     # Only pin a Chrome UA for the Chromium engine. Camoufox generates its own
     # coherent Firefox fingerprint at launch — forcing a Chrome UA onto it would
     # be a glaring inconsistency that defeats the point.
@@ -196,7 +248,7 @@ async def _get_context(client_id: str) -> BrowserContext:
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
     ctx = await browser.new_context(**ctx_opts)
-    _contexts[client_id] = ctx
+    _contexts[key] = ctx
     return ctx
 
 
@@ -318,6 +370,133 @@ def _domain(url: str) -> str:
         return urlparse(url).netloc.lower().lstrip("www.")
     except Exception:
         return ""
+
+
+# ============================================================================
+# Network capture + request-body parsing. The single move that turns a brittle
+# JS-dropdown dashboard into a one-shot is: watch the XHR/fetch the page fires,
+# learn the endpoint + params, then replay that endpoint directly (same-origin,
+# so cookies / CSRF / referer all match). inspect_network() does the watching;
+# call_api() does the replay; act() captures opportunistically so a UI step that
+# times out still leaves the agent the API it would have triggered.
+# ============================================================================
+
+# Resource types worth recording — the data-bearing calls. Documents/scripts/
+# images/fonts/css are noise for API discovery.
+_CAPTURE_TYPES = ("xhr", "fetch")
+
+
+def _parse_request_body(body: str | None) -> dict[str, Any] | None:
+    """Best-effort structure a request post-body so the agent sees PARAM NAMES.
+
+    Returns {"kind": "json"|"form"|"raw", "data": ...} or None. Param names are
+    the prize — they're what you template into call_api to pull other periods
+    (e.g. PPAC's financialYear / reportBy / pageId)."""
+    if not body:
+        return None
+    b = body.strip()
+    if not b:
+        return None
+    if b[:1] in "{[":
+        try:
+            return {"kind": "json", "data": json.loads(b)}
+        except Exception:  # noqa: BLE001
+            pass
+    if "=" in b and "\n" not in b[:200]:
+        try:
+            from urllib.parse import parse_qsl
+            pairs = parse_qsl(b, keep_blank_values=True)
+            if pairs:
+                return {"kind": "form", "data": dict(pairs)}
+        except Exception:  # noqa: BLE001
+            pass
+    return {"kind": "raw", "data": b[:2000]}
+
+
+class _NetworkRecorder:
+    """Attach to a Page and record data-bearing requests (XHR/fetch) with their
+    request bodies and a sample of each response. Reading a response body is
+    async, so each is read in a background task that we await in finalize()."""
+
+    def __init__(self, *, max_entries: int = 80, body_cap: int = 4000,
+                 capture_types: tuple[str, ...] = _CAPTURE_TYPES) -> None:
+        self.entries: list[dict[str, Any]] = []
+        self._tasks: list[asyncio.Task] = []
+        self.max_entries = max_entries
+        self.body_cap = body_cap
+        self.capture_types = capture_types
+
+    def attach(self, page: Page) -> None:
+        page.on("response", self._on_response)
+
+    def _on_response(self, response: Any) -> None:  # sync Playwright callback
+        try:
+            if len(self.entries) >= self.max_entries:
+                return
+            req = response.request
+            rtype = req.resource_type
+            if rtype not in self.capture_types:
+                return
+            try:
+                post = req.post_data
+            except Exception:  # noqa: BLE001
+                post = None
+            try:
+                ct = (response.headers or {}).get("content-type", "")
+            except Exception:  # noqa: BLE001
+                ct = ""
+            entry: dict[str, Any] = {
+                "method": req.method,
+                "url": req.url,
+                "resource_type": rtype,
+                "status": getattr(response, "status", None),
+                "content_type": ct.lower(),
+                "request_body": _parse_request_body(post),
+            }
+            self.entries.append(entry)
+            # Only bother reading text-ish bodies; binary/json get capped.
+            if any(k in entry["content_type"]
+                   for k in ("json", "text", "javascript", "xml")):
+                self._tasks.append(
+                    asyncio.ensure_future(self._read_body(response, entry)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _read_body(self, response: Any, entry: dict[str, Any]) -> None:
+        try:
+            txt = await response.text()
+            if txt:
+                entry["response_sample"] = txt[: self.body_cap]
+                entry["response_truncated"] = len(txt) > self.body_cap
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def finalize(self) -> list[dict[str, Any]]:
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        return self.entries
+
+    def discovered_api(self, limit: int = 12) -> list[dict[str, Any]]:
+        """Distinct data endpoints, freshest first, deduped by
+        (method, path, sorted param keys) — the agent-facing projection."""
+        seen: set[tuple] = set()
+        out: list[dict[str, Any]] = []
+        for e in reversed(self.entries):
+            try:
+                path = urlparse(e["url"]).path
+            except Exception:  # noqa: BLE001
+                path = e["url"]
+            rb = e.get("request_body") or {}
+            keys = tuple(sorted((rb.get("data") or {}).keys())) \
+                if isinstance(rb.get("data"), dict) else ()
+            sig = (e["method"], path, keys)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(e)
+            if len(out) >= limit:
+                break
+        return out
 
 
 # ============================================================================
@@ -541,6 +720,7 @@ async def visit(
     full_page_screenshot: bool = False,
     text_cap: int = 30_000,
     return_screenshot_b64: bool = False,
+    use_proxy: bool = False,
 ) -> dict[str, Any]:
     """Navigate to URL with a real Chromium and return its rendered state.
 
@@ -577,6 +757,7 @@ async def visit(
 
     cache_key = _stable_key(
         "visit", url, wait_for_selector, full_page_screenshot, text_cap,
+        use_proxy,
     )
     if cached := _visit_cache.get(cache_key):
         _emit("visit", t0, cache_hit=True,
@@ -589,7 +770,7 @@ async def visit(
         return {k: v for k, v in cached.items() if k != "screenshot_b64"}
 
     client_id = _current_client.get() or "anon"
-    ctx = await _get_context(client_id)
+    ctx = await _get_context(client_id, proxied=use_proxy)
 
     def _finalize_fb(fb: dict[str, Any]) -> dict[str, Any]:
         # Cache + shape a fallback result exactly like a normal visit() return.
@@ -764,6 +945,7 @@ async def act(
     timeout_ms: int = 60_000,
     full_page_screenshot: bool = True,
     include_screenshot_in_response: bool = False,
+    use_proxy: bool = False,
 ) -> dict[str, Any]:
     """Drive a real Chromium through a sequence of steps on a page, then run
     structured extraction on the final state.
@@ -815,8 +997,14 @@ async def act(
         return {"error": "steps must be a non-empty list"}
 
     client_id = _current_client.get() or "anon"
-    ctx = await _get_context(client_id)
+    ctx = await _get_context(client_id, proxied=use_proxy)
     page = await ctx.new_page()
+    # Record the XHR/fetch the page fires while we drive it. Even if a UI step
+    # times out (a non-native JS widget, say), the captured endpoint lets the
+    # agent pivot to call_api instead of giving up.
+    rec = _NetworkRecorder()
+    rec.attach(page)
+    fetch_sink: list[dict[str, Any]] = []
     step_results: list[dict[str, Any]] = []
     try:
         # Initial navigation.
@@ -838,7 +1026,7 @@ async def act(
             action, arg = next(iter(step.items()))
             s_t0 = time.perf_counter()
             try:
-                await _run_step(page, action, arg, timeout_ms)
+                await _run_step(page, action, arg, timeout_ms, sink=fetch_sink)
                 step_results.append({
                     "step_index": idx, "action": action, "ok": True,
                     "duration_ms": round((time.perf_counter() - s_t0) * 1000),
@@ -914,10 +1102,29 @@ async def act(
         auth_wall = _looks_authwalled(text)
         if auth_wall:
             out["auth_wall"] = auth_wall
+        # Network capture → adaptive recovery. Surface the data endpoints the
+        # page hit, and if a UI step failed but the page still fired a
+        # data-bearing request, tell the agent to replay it via call_api rather
+        # than re-driving the widget.
+        await rec.finalize()
+        observed = rec.discovered_api(limit=8)
+        if observed:
+            out["observed_api"] = [{
+                "method": e["method"], "url": e["url"],
+                "request_params": (e.get("request_body") or {}).get("data")
+                if isinstance(e.get("request_body"), dict) else None,
+                "status": e.get("status"),
+            } for e in observed]
+        hint = _recovery_hint(step_results, observed)
+        if hint:
+            out["recovery_hint"] = hint
+        if fetch_sink:
+            out["fetch_results"] = fetch_sink
         if include_screenshot_in_response and shot_b64:
             out["screenshot_b64"] = shot_b64
         _emit("act", t0,
-               extra={"steps": len(steps), "shot_kb": round(shot_bytes / 1024)})
+               extra={"steps": len(steps), "shot_kb": round(shot_bytes / 1024),
+                      "observed_api": len(observed)})
         return out
     finally:
         try:
@@ -926,12 +1133,57 @@ async def act(
             pass
 
 
-async def _run_step(page: Page, action: str, arg: Any, timeout_ms: int) -> None:
+def _recovery_hint(step_results: list[dict[str, Any]],
+                   observed: list[dict[str, Any]]) -> str | None:
+    """If a UI step failed (e.g. select_option timed out on a non-native JS
+    widget) but the page still fired a data-bearing XHR/fetch, point the agent
+    at the call_api replay path instead of re-driving the widget."""
+    failed = [s for s in step_results
+              if not s.get("ok") and s.get("action") in
+              ("select", "click", "fill", "press")]
+    if not failed:
+        return None
+    posts = [e for e in observed
+             if e.get("method") in ("POST", "GET")
+             and (e.get("request_body") or e.get("method") == "POST")]
+    target = posts[0] if posts else (observed[0] if observed else None)
+    if not target:
+        return None
+    rb = target.get("request_body") or {}
+    params = rb.get("data") if isinstance(rb, dict) else None
+    return (
+        f"A UI step ({failed[0].get('action')}) failed — likely a non-native JS "
+        f"widget. The page nonetheless fired {target.get('method')} "
+        f"{target.get('url')}"
+        + (f" with params {params}" if params else "")
+        + ". Replay it directly with call_api (templating the params for the "
+        "period you want); this also reaches values the widget never exposes."
+    )
+
+
+async def _run_step(page: Page, action: str, arg: Any, timeout_ms: int,
+                    sink: list[dict[str, Any]] | None = None) -> None:
     """Dispatch a single step from act()'s steps[] to Playwright. Each branch
     is intentionally narrow — anything else is rejected so the agent learns
-    the supported vocabulary."""
+    the supported vocabulary. `sink` collects the return value of data-yielding
+    steps (currently fetch_json) so act() can surface them."""
     bounded = lambda v, default: min(int(v or default), timeout_ms)  # noqa: E731
 
+    if action == "fetch_json":
+        # In-page fetch from the page's own origin — cookies / CSRF / referer
+        # all match, so a same-origin AJAX endpoint replays cleanly. THE move
+        # for JS-dropdown dashboards: skip the widget, hit the endpoint it fires.
+        if not isinstance(arg, dict) or not arg.get("url"):
+            raise ValueError("fetch_json requires {url, method?, body?, headers?}")
+        res = await _page_fetch(
+            page, arg["url"], method=str(arg.get("method", "GET")),
+            body=arg.get("body"), headers=arg.get("headers"),
+            content_type=arg.get("content_type"),
+        )
+        if sink is not None:
+            sink.append({"request": {k: arg.get(k) for k in
+                                     ("url", "method", "body")}, "result": res})
+        return
     if action == "goto":
         await page.goto(str(arg), wait_until="domcontentloaded",
                           timeout=timeout_ms)
@@ -981,6 +1233,265 @@ async def _run_step(page: Page, action: str, arg: Any, timeout_ms: int) -> None:
                               "bytes": len(png)}))
     else:
         raise ValueError(f"unsupported action: {action!r}")
+
+
+# ============================================================================
+# API discovery + replay. The pattern these implement, end to end:
+#   1. inspect_network(url[, steps])  → see which XHR/fetch the page fires and
+#      with what params (the discovery step).
+#   2. call_api(endpoint, method, body) → replay that endpoint directly, with
+#      arbitrary params, from the page's own origin (the replay step). This
+#      reaches periods the UI never exposes (e.g. a year missing from a
+#      dropdown) and never touches the brittle widget.
+#   3. Persist the recipe as a playbook `api` entry so step 1 is skipped next
+#      time.
+# ============================================================================
+
+def _encode_body(body: Any, content_type: str | None) -> tuple[Any, str | None]:
+    """Turn a dict/str body into (wire_string, content_type). A dict defaults to
+    form-encoding (what most gov AJAX endpoints want); pass content_type
+    'application/json' to send it as JSON instead."""
+    if body is None:
+        return None, content_type
+    if isinstance(body, str):
+        return body, content_type
+    if isinstance(body, dict):
+        if content_type and "json" in content_type:
+            return json.dumps(body), content_type
+        from urllib.parse import urlencode
+        return urlencode(body), (content_type
+                                 or "application/x-www-form-urlencoded")
+    return str(body), content_type
+
+
+async def _page_fetch(page: Page, url: str, *, method: str = "GET",
+                      body: Any = None, headers: dict[str, str] | None = None,
+                      content_type: str | None = None,
+                      body_cap: int = 40_000) -> dict[str, Any]:
+    """Run fetch() inside the page so the request inherits the page's origin,
+    cookies and session. Returns {status, content_type, ok, json|text}."""
+    wire_body, ct = _encode_body(body, content_type)
+    hdrs = {"X-Requested-With": "XMLHttpRequest"}
+    if ct:
+        hdrs["Content-Type"] = ct
+    if headers:
+        hdrs.update(headers)
+    method = method.upper()
+    res = await page.evaluate(
+        """async (a) => {
+            const opt = {method: a.method, headers: a.headers,
+                         credentials: 'include'};
+            if (a.body != null && a.method !== 'GET' && a.method !== 'HEAD')
+                opt.body = a.body;
+            const r = await fetch(a.url, opt);
+            const text = await r.text();
+            return {status: r.status, ok: r.ok,
+                    content_type: r.headers.get('content-type') || '', text};
+        }""",
+        {"url": url, "method": method, "headers": hdrs, "body": wire_body},
+    )
+    text = res.get("text") or ""
+    out: dict[str, Any] = {
+        "status": res.get("status"),
+        "ok": res.get("ok"),
+        "content_type": res.get("content_type", ""),
+    }
+    parsed = None
+    if text:
+        try:
+            parsed = json.loads(text)
+        except Exception:  # noqa: BLE001
+            parsed = None
+    if parsed is not None:
+        out["json"] = parsed
+    else:
+        out["text"] = text[:body_cap]
+        out["text_truncated"] = len(text) > body_cap
+    return out
+
+
+async def call_api(
+    url: str,
+    *,
+    method: str = "GET",
+    body: Any = None,
+    headers: dict[str, str] | None = None,
+    page_url: str | None = None,
+    content_type: str | None = None,
+    timeout_ms: int = 30_000,
+    use_proxy: bool = False,
+) -> dict[str, Any]:
+    """Replay an API/AJAX endpoint directly from a real browser origin.
+
+    Loads a page on the endpoint's origin first (so cookies, CSRF state,
+    Origin/Referer all match), then issues the request via in-page fetch().
+    Bypasses brittle UI widgets entirely and reaches data the front-end never
+    surfaces (e.g. a fiscal year missing from a dropdown).
+
+    Args:
+        url: The endpoint URL (absolute).
+        method: HTTP method (GET/POST/…). Default GET.
+        body: Request body — a dict (form-encoded by default; JSON if
+            content_type is application/json) or a pre-encoded string.
+        headers: Extra request headers (merged over the XHR defaults).
+        page_url: Origin page to load before fetching. Defaults to the
+            endpoint's scheme://host/. Set this to the actual dashboard URL
+            when the endpoint checks Referer.
+        content_type: Override the request Content-Type.
+        timeout_ms: Navigation timeout for loading page_url.
+
+    Returns:
+        {url, page_url, status, content_type, ok, json|text, source: "browser_api"}
+    """
+    t0 = time.perf_counter()
+    if not url:
+        return {"error": "url is required"}
+    parsed_u = urlparse(url)
+    origin = (page_url or
+              f"{parsed_u.scheme or 'https'}://{parsed_u.netloc}/")
+    client_id = _current_client.get() or "anon"
+    ctx = await _get_context(client_id, proxied=use_proxy)
+    page = await ctx.new_page()
+    try:
+        try:
+            await page.goto(origin, wait_until="domcontentloaded",
+                            timeout=timeout_ms)
+        except Exception as e:  # noqa: BLE001
+            _emit("call_api", t0, extra={"error": f"goto:{str(e)[:60]}"})
+            return {"error": f"could not load origin page {origin}: {e}",
+                    "url": url, "page_url": origin}
+        try:
+            res = await _page_fetch(page, url, method=method, body=body,
+                                    headers=headers, content_type=content_type)
+        except Exception as e:  # noqa: BLE001
+            _emit("call_api", t0, extra={"error": f"fetch:{str(e)[:60]}"})
+            return {"error": f"in-page fetch failed: {e}", "url": url,
+                    "page_url": origin}
+        out = {"url": url, "page_url": origin, "domain": _domain(url),
+               "source": "browser_api", **res,
+               "fetched_at": datetime.now(timezone.utc).isoformat()}
+        _emit("call_api", t0, extra={"status": res.get("status"),
+                                     "has_json": "json" in res})
+        return out
+    finally:
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def inspect_network(
+    url: str,
+    *,
+    steps: list[dict[str, Any]] | None = None,
+    timeout_ms: int = 60_000,
+    settle_ms: int = 2500,
+    url_filter: str | None = None,
+    max_entries: int = 80,
+    body_cap: int = 4000,
+    use_proxy: bool = False,
+) -> dict[str, Any]:
+    """Open a page (optionally running `act`-style steps) and report the
+    XHR/fetch calls it fires — endpoint, method, request params, response sample.
+
+    This is the discovery half of the API-replay pattern. Run it once on a
+    JS-driven dashboard to learn which endpoint feeds the table/chart and what
+    params it takes; then hit that endpoint with call_api (templating the params
+    for the period you actually want). Pass `steps` to capture the request a
+    dropdown/tab/button fires — e.g. select a year, then read the endpoint it hit.
+
+    Args:
+        url: Page to open.
+        steps: Optional `act`-vocabulary steps to run while recording (e.g.
+            change a dropdown so its AJAX call is captured).
+        timeout_ms: Navigation/step timeout.
+        settle_ms: Extra wait after load/steps so late XHRs are captured.
+        url_filter: Optional substring; only requests whose URL contains it are
+            returned (e.g. "Ajax" or "/api/").
+        max_entries: Cap on recorded requests.
+        body_cap: Per-response sample cap (chars).
+
+    Returns:
+        {url, final_url, request_count, requests: [{method, url,
+         resource_type, status, content_type, request_params, response_sample,
+         response_truncated}], step_results?}
+    """
+    t0 = time.perf_counter()
+    if not url:
+        return {"error": "url is required"}
+    client_id = _current_client.get() or "anon"
+    ctx = await _get_context(client_id, proxied=use_proxy)
+    page = await ctx.new_page()
+    rec = _NetworkRecorder(max_entries=max_entries, body_cap=body_cap)
+    rec.attach(page)
+    step_results: list[dict[str, Any]] = []
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded",
+                            timeout=timeout_ms)
+        except Exception as e:  # noqa: BLE001
+            _emit("inspect_network", t0, extra={"error": f"goto:{str(e)[:60]}"})
+            return {"error": f"navigation failed: {e}", "url": url}
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:  # noqa: BLE001
+            pass
+        for idx, step in enumerate(steps or []):
+            if not isinstance(step, dict) or len(step) != 1:
+                step_results.append({"step_index": idx, "ok": False,
+                                     "error": "each step must be {action: arg}"})
+                continue
+            action, arg = next(iter(step.items()))
+            s_t0 = time.perf_counter()
+            try:
+                await _run_step(page, action, arg, timeout_ms)
+                step_results.append({"step_index": idx, "action": action,
+                                     "ok": True,
+                                     "duration_ms": round(
+                                         (time.perf_counter() - s_t0) * 1000)})
+            except Exception as e:  # noqa: BLE001
+                step_results.append({"step_index": idx, "action": action,
+                                     "ok": False, "error": str(e)[:200]})
+        if settle_ms > 0:
+            await page.wait_for_timeout(settle_ms)
+        final_url = page.url
+        await rec.finalize()
+
+        def _shape(e: dict[str, Any]) -> dict[str, Any]:
+            rb = e.get("request_body") or {}
+            return {
+                "method": e["method"],
+                "url": e["url"],
+                "resource_type": e["resource_type"],
+                "status": e.get("status"),
+                "content_type": e.get("content_type", ""),
+                "request_params": rb.get("data") if isinstance(rb, dict) else None,
+                "request_body_kind": rb.get("kind") if isinstance(rb, dict) else None,
+                "response_sample": e.get("response_sample"),
+                "response_truncated": e.get("response_truncated", False),
+            }
+
+        reqs = [_shape(e) for e in rec.discovered_api(limit=max_entries)]
+        if url_filter:
+            reqs = [r for r in reqs if url_filter.lower() in r["url"].lower()]
+        out: dict[str, Any] = {
+            "url": url,
+            "final_url": final_url,
+            "domain": _domain(final_url),
+            "request_count": len(reqs),
+            "requests": reqs,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if steps:
+            out["step_results"] = step_results
+        _emit("inspect_network", t0, extra={"reqs": len(reqs),
+                                            "steps": len(steps or [])})
+        return out
+    finally:
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _sonnet_extract(visited: dict[str, Any], *, focus: str = "") -> dict[str, Any]:
@@ -1075,6 +1586,7 @@ async def extract(
     wait_for_selector: str | None = None,
     full_page_screenshot: bool = True,
     include_screenshot_in_response: bool = False,
+    use_proxy: bool = False,
 ) -> dict[str, Any]:
     """Visit URL with Chromium → Sonnet structured extraction.
 
@@ -1098,6 +1610,7 @@ async def extract(
         # back out unless the caller explicitly asked for it via
         # include_screenshot_in_response.
         return_screenshot_b64=True,
+        use_proxy=use_proxy,
     )
     if "error" in visited:
         return visited
@@ -1314,6 +1827,7 @@ async def download_file(
     pages: list[int] | None = None,
     max_rows_per_sheet: int = 200,
     max_pdf_pages: int = 30,
+    use_proxy: bool = False,
 ) -> dict[str, Any]:
     """Download a URL and parse it as a spreadsheet (.xlsx/.xlsm/.xls/.csv/
     .tsv) or PDF. Format is auto-detected via content-type + magic bytes.
@@ -1340,9 +1854,10 @@ async def download_file(
                    "application/vnd.ms-excel, application/pdf, text/csv, */*;q=0.8"),
         "Accept-Language": "en-US,en;q=0.9",
     }
+    proxy_url = _httpx_proxy_url() if use_proxy else None
     try:
         async with httpx.AsyncClient(timeout=90.0, follow_redirects=True,
-                                       headers=headers) as client:
+                                       headers=headers, proxy=proxy_url) as client:
             r = await client.get(url)
     except httpx.HTTPError as e:
         out = {"error": f"download failed: {e}", "error_kind": "http_error",

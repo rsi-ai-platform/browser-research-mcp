@@ -60,3 +60,8 @@ packages = ["src/browser_research"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# auto so future browser-driving tests can be plain `async def` without a marker
+asyncio_mode = "auto"
