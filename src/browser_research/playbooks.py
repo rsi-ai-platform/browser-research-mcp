@@ -1,11 +1,15 @@
 """Domain playbooks — per-site recipes the agent reads BEFORE attacking a known
 hard page, so exploration becomes a lookup.
 
-Source of truth, in order:
-  1. GCS object (PLAYBOOKS_GCS_BUCKET / PLAYBOOKS_GCS_OBJECT) — editable WITHOUT
-     a redeploy; hot-reloaded on a short TTL so admin edits take effect live.
-  2. DEFAULT_PLAYBOOKS below — the in-repo seed / fallback when GCS is
-     unconfigured or unreachable.
+Effective list = the in-repo DEFAULT_PLAYBOOKS with the GCS object LAYERED ON
+TOP, keyed by id:
+  * GCS object (PLAYBOOKS_GCS_BUCKET / PLAYBOOKS_GCS_OBJECT) — the live overlay,
+    editable WITHOUT a redeploy; hot-reloaded on a short TTL. Overrides/extends
+    per-id (and may carry brand-new ids).
+  * DEFAULT_PLAYBOOKS below — the in-repo seed. Ids not present in the overlay
+    come straight from here, so a NEW code-default playbook auto-surfaces even
+    when an overlay exists (no re-seed needed). When GCS is unconfigured or
+    unreachable, the defaults stand alone.
 
 An entry:
   {
@@ -261,6 +265,34 @@ def _save_to_gcs_sync(entries: list[dict[str, Any]]) -> None:
     )
 
 
+def _merge_playbooks(defaults: list[dict[str, Any]],
+                     overlay: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Effective playbooks = code `defaults` with the GCS `overlay` layered on
+    top, keyed by id: the overlay overrides/extends per-id, default-only ids
+    remain, overlay-only ids are appended. So a new code-default playbook
+    auto-surfaces even when an overlay exists (no re-seed), while the overlay
+    still wins for any id it defines. id-less overlay entries are kept."""
+    by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for e in defaults:
+        eid = e.get("id")
+        if eid is None:
+            continue
+        if eid not in by_id:
+            order.append(eid)
+        by_id[eid] = e
+    extras: list[dict[str, Any]] = []
+    for e in (overlay or []):
+        eid = e.get("id")
+        if eid is None:
+            extras.append(e)
+            continue
+        if eid not in by_id:
+            order.append(eid)
+        by_id[eid] = e
+    return [by_id[i] for i in order] + extras
+
+
 async def get_playbooks(force: bool = False) -> list[dict[str, Any]]:
     """Return the effective playbook list, hot-reloading from GCS on TTL."""
     now = time.time()
@@ -271,11 +303,14 @@ async def get_playbooks(force: bool = False) -> list[dict[str, Any]]:
         if (not force and _cache["data"] is not None
                 and (now - _cache["ts"]) < _TTL):
             return _cache["data"]
-        data = await asyncio.to_thread(_load_from_gcs_sync)
-        if data is not None:
-            _cache.update(ts=time.time(), data=data, source="gcs")
+        overlay = await asyncio.to_thread(_load_from_gcs_sync)
+        if overlay is not None:
+            _cache.update(ts=time.time(),
+                          data=_merge_playbooks(DEFAULT_PLAYBOOKS, overlay),
+                          source="gcs")
         else:
-            _cache.update(ts=time.time(), data=DEFAULT_PLAYBOOKS, source="default")
+            _cache.update(ts=time.time(), data=list(DEFAULT_PLAYBOOKS),
+                          source="default")
         return _cache["data"]
 
 

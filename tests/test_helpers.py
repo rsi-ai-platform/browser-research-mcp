@@ -127,3 +127,25 @@ def test_for_agent_includes_api():
         "https://ppac.gov.in/natural-gas/consumption")
     projected = playbooks.for_agent(pb)
     assert "api" in projected and projected["api"][0]["method"] == "POST"
+
+
+# --------------------------------------------------------------------------
+# playbooks._merge_playbooks — GCS overlay layered on code defaults by id.
+# --------------------------------------------------------------------------
+
+def test_merge_overlay_overrides_and_extends():
+    defaults = [{"id": "a", "match": {"domain": "a.in"}, "strategy": "DA"},
+                {"id": "b", "match": {"domain": "b.in"}, "strategy": "DB"}]
+    overlay = [{"id": "b", "match": {"domain": "b.in"}, "strategy": "OB"},
+               {"id": "c", "match": {"domain": "c.in"}, "strategy": "OC"}]
+    merged = playbooks._merge_playbooks(defaults, overlay)
+    by = {p["id"]: p for p in merged}
+    assert [p["id"] for p in merged] == ["a", "b", "c"]
+    assert by["a"]["strategy"] == "DA"   # default-only id stays
+    assert by["b"]["strategy"] == "OB"   # overlay wins per-id
+    assert by["c"]["strategy"] == "OC"   # overlay-only id appended
+
+
+def test_merge_empty_overlay_is_defaults():
+    assert playbooks._merge_playbooks(playbooks.DEFAULT_PLAYBOOKS, []) == \
+        list(playbooks.DEFAULT_PLAYBOOKS)

@@ -163,11 +163,15 @@ datacenter egress. Two reactive flags compose with it: `blocked` (CDN bot-wall)
 and `auth_wall` (login/registration gate) → both mean "stop driving the page,
 use the playbook's open source."
 
-**Source of truth:** the GCS object at `gs://$PLAYBOOKS_GCS_BUCKET/$PLAYBOOKS_GCS_OBJECT`
-(hot-reloaded every `PLAYBOOKS_TTL_SECONDS`), falling back to the in-repo
-`playbooks.py` defaults (seeded with PPAC + PIB) when GCS is unset/unreachable.
-Editing the GCS object takes effect **without a redeploy**. The Cloud Run runtime
-SA needs `roles/storage.objectAdmin` on the bucket.
+**Source of truth — overlay model.** The effective list is the in-repo
+`playbooks.py` defaults with the GCS object at
+`gs://$PLAYBOOKS_GCS_BUCKET/$PLAYBOOKS_GCS_OBJECT` **layered on top, keyed by
+`id`** (hot-reloaded every `PLAYBOOKS_TTL_SECONDS`): the overlay overrides/extends
+per-id and may add brand-new ids, while ids it doesn't define come straight from
+code — so a **new code-default playbook auto-surfaces with no re-seed**. When GCS
+is unset/unreachable, the defaults stand alone. Editing the overlay takes effect
+**without a redeploy**; the Cloud Run runtime SA needs `roles/storage.objectAdmin`
+on the bucket.
 
 **Admin API** (token-gated by `ADMIN_TOKEN`, fail-closed if unset; needs an HTTP
 transport + a FastMCP build with `custom_route`):
