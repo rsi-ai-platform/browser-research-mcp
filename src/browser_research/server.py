@@ -64,6 +64,40 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+async def today() -> dict[str, Any]:
+    """Return the SERVER'S CURRENT DATE (IST, Asia/Kolkata). Call this
+    FIRST whenever the user mentions a temporal phrase like "latest",
+    "current", "today", "yesterday", "this quarter", "this year" — your
+    training-data cutoff is NOT a reliable anchor. Use the returned
+    `iso_date` and `financial_year_in` to construct concrete queries
+    you pass to the other tools.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    ist = _tz(_td(hours=5, minutes=30))
+    now = _dt.now(ist)
+    fy_start = now.year if now.month >= 4 else now.year - 1
+    fy_end = fy_start + 1
+    return {
+        "iso_date": now.strftime("%Y-%m-%d"),
+        "iso_datetime": now.isoformat(),
+        "year": now.year,
+        "month": now.strftime("%B"),
+        "month_num": now.month,
+        "day": now.day,
+        "weekday": now.strftime("%A"),
+        "quarter": f"Q{(now.month - 1) // 3 + 1}",
+        "financial_year_in": f"FY{str(fy_end)[-2:]}",
+        "fy_label": f"{fy_start}-{fy_end}",
+        "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+        "note": (
+            "FY in India is April→March. Use iso_date as the anchor for "
+            "every relative temporal phrase. Pass concrete dates derived "
+            "from this date to visit/act/extract/download_file."
+        ),
+    }
+
+
+@mcp.tool()
 async def visit(
     url: str,
     wait_for_selector: str | None = None,
