@@ -66,7 +66,13 @@ def main() -> None:
         # Mcp-Session-Id between requests.
         mcp.settings.stateless_http = True
         mcp.settings.json_response = True
-        mcp.run("streamable-http")
+        # Manual uvicorn so the hybrid auth middleware can attach.
+        import uvicorn
+        from ._auth import install_auth_middleware
+        app = mcp.streamable_http_app()
+        install_auth_middleware(
+            app, service_url=os.environ.get("SERVICE_URL", "<unset>"))
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     else:
         print(f"unknown transport: {args.transport}", file=sys.stderr)
         sys.exit(2)
