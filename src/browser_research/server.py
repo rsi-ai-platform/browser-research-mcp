@@ -178,6 +178,16 @@ async def today() -> dict[str, Any]:
     fy_months_elapsed = now.month - 3 if now.month >= 4 else now.month + 9
     fy_quarter_in = (fy_months_elapsed - 1) // 3 + 1
     last_completed_fy_start = current_fy_start - 1
+    _IN_MONTHS = ["April", "May", "June", "July", "August", "September",
+                   "October", "November", "December", "January", "February", "March"]
+    completed_fy_months = _IN_MONTHS[:max(0, fy_months_elapsed - 1)]
+    current_fy_month_partial = (
+        _IN_MONTHS[fy_months_elapsed - 1] if fy_months_elapsed >= 1 else None
+    )
+    completed_fy_quarters: list[dict[str, Any]] = []
+    for q in range(1, fy_quarter_in):
+        qs = _IN_MONTHS[(q - 1) * 3:(q - 1) * 3 + 3]
+        completed_fy_quarters.append({"label": f"Q{q}", "months": qs})
 
     def _fy_label(start: int) -> str:
         return f"FY{str(start + 1)[-2:]}"
@@ -208,13 +218,20 @@ async def today() -> dict[str, Any]:
         "last_completed_fy_in": _fy_label(last_completed_fy_start),
         "last_3_completed_fys_in": last_3,
         "last_3_completed_fy_ranges": last_3_ranges,
+        "current_fy_completed_months": completed_fy_months,
+        "current_fy_completed_quarters": completed_fy_quarters,
+        "current_fy_partial_month": current_fy_month_partial,
         "note": (
-            "Indian FY runs April→March. CRITICAL FOR 'LAST N YEARS' "
-            "QUERIES: financial_year_in above is IN PROGRESS — do NOT "
-            "include it in 'last N completed years'. 'Last 3 years' → "
-            "last_3_completed_fys_in. Use iso_date + fy_quarter_in + "
-            "fy_month_in to ALSO fetch partial data for the in-progress "
-            "FY when relevant."
+            "Indian FY runs April→March. For 'last N years' queries: "
+            "cover the last N COMPLETED FYs (last_3_completed_fys_in) AND "
+            "the in-progress current FY up to today — completed months "
+            "(current_fy_completed_months), completed quarters "
+            "(current_fy_completed_quarters), and partial-month / daily / "
+            "weekly data right up to iso_date. Data cadence varies — "
+            "daily petrol prices, weekly money-supply, monthly CPI / IIP, "
+            "quarterly GDP — always look for the freshest data the source "
+            "publishes; do NOT cap your query at the previous FY's "
+            "March 31."
         ),
     }
 
