@@ -115,6 +115,53 @@ DEFAULT_PLAYBOOKS: list[dict[str, Any]] = [
         "last_verified": "2026-06-16",
     },
     {
+        "id": "cga-monthly-accounts",
+        "match": {"domain": "cga.nic.in"},
+        "strategy": ("Headline Union-Govt fiscal data (Total Receipts, "
+                     "Expenditure, Deficit; actuals vs BE/RE; monthly since "
+                     "Apr-2015) lives in ONE downloadable Excel on the Monthly "
+                     "Accounts Dashboard — NOT in the homepage month-picker "
+                     "(those are ASP.NET __doPostBack controls; don't drive "
+                     "them). visit the dashboard page, take the .xlsm "
+                     "file_link, then download_file it with a `query` (e.g. "
+                     "'February 2026 fiscal deficit') to pull just the rows you "
+                     "need rather than the whole workbook."),
+        "avoid": [
+            "driving the homepage #account-section month/year selectors — "
+            "ASP.NET postback widgets, not real links; the data isn't gated "
+            "behind them",
+            "loading the whole dashboard .xlsm into context — it holds every "
+            "month since 2015-16; use download_file(query=...) to grep only the "
+            "target period",
+            "guessing the .xlsm filename — the suffix varies; read the live "
+            "href off the dashboard page",
+        ],
+        "open_data": [
+            {"tool": "visit",
+             "url": "https://cga.nic.in/MonthDashboardReport/Published/list.aspx",
+             "note": "Monthly Accounts Dashboard — static page; exposes the "
+                     "current 'DAMA dashboard <Month> <Year> Data file….xlsm' "
+                     "link under /writereaddata/MonthAccount/"
+                     "MonthAccountDashboard/. Grab that href, then "
+                     "download_file it (with query= for one period)."},
+            {"tool": "download_file",
+             "url_pattern": "https://cga.nic.in/writereaddata/MonthAccount/"
+                            "MonthAccountDashboard/DAMA dashboard <Month> "
+                            "<Year> Data file*.xlsm",
+             "note": ".xlsm covering all FY/months since 2015-16. Pass query= "
+                     "to return only matching rows."},
+            {"tool": "web_fetch",
+             "url": "https://cga.nic.in/Accountproc.aspx",
+             "note": "Financial Reports index (Monthly/Annual Accounts, "
+                     "Finance & Appropriation Accounts)."},
+            {"tool": "web_fetch",
+             "url": "https://cga.nic.in/NSD/Published/list.aspx",
+             "note": "National Summary Data Page (IMF SDDS) — key fiscal "
+                     "aggregates, server-rendered."},
+        ],
+        "last_verified": "2026-06-16",
+    },
+    {
         "id": "pib-allrel",
         "match": {"domain": "pib.gov.in", "path_prefix": "/allRel.aspx"},
         "strategy": ("Date-filtered ASP.NET listing. Needs a NON-datacenter IP "
