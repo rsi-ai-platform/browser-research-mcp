@@ -123,6 +123,11 @@ jobs:
             --region=$REGION --project=$PROJECT_ID \
             --format='value(status.url)')
           echo "Service URL: $URL"
+          # The MCP enforces HybridAuthMiddleware — unauthed POST /mcp
+          # returns 401. Pull the static bearer from Secret Manager (same
+          # value bound on the service as MCP_BEARER_TOKEN).
+          TOKEN=$(gcloud secrets versions access latest \
+            --secret=mcp-bearer-browser --project=$PROJECT_ID)
           # The server runs in stateless HTTP mode (mcp.settings.stateless_http
           # = True in __main__.py) so initialize does NOT return an
           # Mcp-Session-Id and subsequent calls don't carry one — that's by
@@ -131,6 +136,7 @@ jobs:
           RESP=$(curl -fsS -X POST "$URL/mcp" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
+            -H "Authorization: Bearer $TOKEN" \
             -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}')
           echo "$RESP" | head -c 400
           for T in visit extract act; do
