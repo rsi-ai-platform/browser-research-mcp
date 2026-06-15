@@ -39,6 +39,9 @@ log = logging.getLogger("browser_research")
 
 _pw_instance: Any | None = None
 _browser: Browser | None = None
+# Set only when BROWSER_ENGINE=camoufox — the AsyncCamoufox context manager that
+# owns the Firefox process + its own Playwright instance (closed in shutdown()).
+_camoufox_mgr: Any | None = None
 _contexts: dict[str, BrowserContext] = {}
 _browser_lock = asyncio.Lock()
 
@@ -63,6 +66,18 @@ def _anthropic_model() -> str:
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
+def _tavily_key() -> str | None:
+    return os.environ.get("TAVILY_API_KEY") or None
+
+
+def _browser_engine() -> str:
+    """Which browser engine to launch: "chromium" (default, patchright) or
+    "camoufox" (Firefox-based anti-detect; optional, see README). Unknown values
+    fall back to chromium."""
+    eng = os.environ.get("BROWSER_ENGINE", "chromium").strip().lower()
+    return eng if eng in ("chromium", "camoufox") else "chromium"
+
+
 async def _anthropic():
     if not _anthropic_key():
         return None
@@ -76,28 +91,75 @@ async def _anthropic():
 
 
 async def _get_browser() -> Browser:
-    global _pw_instance, _browser
+    """Return the shared browser, launching the configured engine on first use."""
+    global _browser
     if _browser is not None and _browser.is_connected():
         return _browser
     async with _browser_lock:
         if _browser is not None and _browser.is_connected():
             return _browser
-        if _pw_instance is None:
-            _pw_instance = await async_playwright().start()
-        # Container-friendly Chromium flags. --no-sandbox is required when
-        # running as root inside Docker; patchright keeps the stealth
-        # patches active regardless.
-        _browser = await _pw_instance.chromium.launch(
-            headless=os.environ.get("HEADLESS", "true").lower() != "false",
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
-        )
-        log.info("Chromium launched (patchright stealth)")
+        if _browser_engine() == "camoufox":
+            _browser = await _launch_camoufox()
+        else:
+            _browser = await _launch_chromium()
         return _browser
+
+
+async def _launch_chromium() -> Browser:
+    """Patchright-patched Chromium — the default engine. Set BROWSER_CHANNEL=chrome
+    to drive a real Google Chrome binary (must be installed in the image) for a
+    genuine Chrome TLS/version fingerprint; unset uses the bundled Chromium."""
+    global _pw_instance
+    if _pw_instance is None:
+        _pw_instance = await async_playwright().start()
+    channel = os.environ.get("BROWSER_CHANNEL") or None
+    # Container-friendly flags. --no-sandbox is required when running as a
+    # non-root user inside Docker; patchright keeps the stealth patches active
+    # regardless.
+    browser = await _pw_instance.chromium.launch(
+        headless=os.environ.get("HEADLESS", "true").lower() != "false",
+        **({"channel": channel} if channel else {}),
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ],
+    )
+    log.info("Chromium launched (patchright stealth, channel=%s)",
+              channel or "bundled")
+    return browser
+
+
+async def _launch_camoufox() -> Browser:
+    """Camoufox — a Firefox fork with engine-level fingerprint spoofing. Optional
+    and lazily imported, so it's a no-op unless BROWSER_ENGINE=camoufox AND the
+    package is installed (`pip install 'camoufox[geoip]'` + `python -m camoufox
+    fetch`). Renders + screenshots like Chromium, so the Sonnet-vision path is
+    unaffected."""
+    global _camoufox_mgr
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except ImportError as e:  # pragma: no cover - only hit when opted in
+        raise RuntimeError(
+            "BROWSER_ENGINE=camoufox but the 'camoufox' package isn't installed. "
+            "Run `pip install 'camoufox[geoip]'` and `python -m camoufox fetch`, "
+            "add Firefox's system libs to the image, then redeploy. "
+            "See README -> Browser engines."
+        ) from e
+    headless_env = os.environ.get("HEADLESS", "true").lower()
+    # "virtual" -> Camoufox auto-manages an Xvfb display (most stealthy on a
+    # headless host; needs xvfb installed). "false" -> headful. else headless.
+    headless: Any = ("virtual" if headless_env == "virtual"
+                     else False if headless_env == "false" else True)
+    # Kept minimal to stay launch-safe across versions. Tune later: humanize=True
+    # (human cursor), os=..., proxy=..., geoip=True (auto-aligns tz/locale/WebGL
+    # to a proxy's exit IP — enable once a residential proxy is wired).
+    mgr = AsyncCamoufox(headless=headless, locale="en-IN")
+    browser = await mgr.__aenter__()
+    _camoufox_mgr = mgr
+    log.info("Camoufox (Firefox) launched (headless=%s)", headless)
+    return browser
 
 
 async def _get_context(client_id: str) -> BrowserContext:
@@ -113,16 +175,21 @@ async def _get_context(client_id: str) -> BrowserContext:
     browser = await _get_browser()
     # India-default geo / language so JS that branches on locale (PPAC, RBI
     # dashboards) renders the Indian build.
-    ctx = await browser.new_context(
-        user_agent=(
+    ctx_opts: dict[str, Any] = {
+        "locale": "en-IN",
+        "timezone_id": "Asia/Kolkata",
+        "viewport": {"width": 1440, "height": 900},
+        "accept_downloads": False,
+    }
+    # Only pin a Chrome UA for the Chromium engine. Camoufox generates its own
+    # coherent Firefox fingerprint at launch — forcing a Chrome UA onto it would
+    # be a glaring inconsistency that defeats the point.
+    if _browser_engine() != "camoufox":
+        ctx_opts["user_agent"] = (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        locale="en-IN",
-        timezone_id="Asia/Kolkata",
-        viewport={"width": 1440, "height": 900},
-        accept_downloads=False,
-    )
+        )
+    ctx = await browser.new_context(**ctx_opts)
     _contexts[client_id] = ctx
     return ctx
 
@@ -130,13 +197,22 @@ async def _get_context(client_id: str) -> BrowserContext:
 async def shutdown() -> None:
     """Graceful cleanup. Cloud Run signals SIGTERM ~10s before kill;
     server.py's lifespan hooks call this."""
-    global _browser, _pw_instance, _contexts
+    global _browser, _pw_instance, _contexts, _camoufox_mgr
     for ctx in list(_contexts.values()):
         try:
             await ctx.close()
         except Exception:
             pass
     _contexts.clear()
+    # Camoufox owns its browser + its own Playwright instance via the context
+    # manager, so exit that instead of closing _browser / _pw_instance directly.
+    if _camoufox_mgr is not None:
+        try:
+            await _camoufox_mgr.__aexit__(None, None, None)
+        except Exception:
+            pass
+        _camoufox_mgr = None
+        _browser = None
     if _browser is not None:
         try:
             await _browser.close()
@@ -239,6 +315,181 @@ def _domain(url: str) -> str:
 
 
 # ============================================================================
+# Fallback fetch chain. The primary path is a real Chromium (visit/act), but
+# gov / enterprise CDNs (Akamai, Cloudflare, Imperva) routinely bot-block our
+# Cloud Run egress IP and serve a 200-OK "Access Denied" / JS-challenge page
+# instead of content. When that happens we re-fetch the SAME url from different
+# infrastructure:
+#   1) Tavily Extract     — cheap, fast, different egress IP. Needs TAVILY_API_KEY.
+#   2) Anthropic web_fetch — server-side fetch via the Messages API. Reuses
+#      ANTHROPIC_API_KEY (already required for extraction). Server-rendered HTML
+#      + PDFs only — no JS rendering.
+# Both return a visit()-shaped dict (plus a `source` tag) so the rest of the
+# pipeline — caching, _sonnet_extract, the MCP response — is unchanged.
+# ============================================================================
+
+# CDN bot-walls return HTTP 200 with a tiny deny/challenge body. Match the
+# common shapes so we fall through instead of handing the agent a useless page.
+_BLOCK_MARKERS = (
+    "access denied",
+    "you don't have permission to access",
+    "attention required",               # Cloudflare
+    "just a moment",                    # Cloudflare JS challenge / DDoS-Guard
+    "checking your browser",
+    "enable javascript and cookies to continue",
+    "request unsuccessful. incapsula",  # Imperva
+    "/cdn-cgi/",                        # Cloudflare challenge assets
+    "reference #",                      # Akamai deny reference id
+)
+
+
+def _looks_blocked(title: str, text: str) -> str | None:
+    """Return a short reason string if (title, text) look like a CDN bot-wall
+    or JS challenge rather than real page content, else None."""
+    t = (title or "").lower()
+    if any(m in t for m in ("access denied", "attention required",
+                            "just a moment", "forbidden")):
+        return "challenge_title"
+    body = (text or "").strip()
+    if len(body) < 32:
+        return "empty_body"
+    # Real pages occasionally mention "access denied" in prose, so only treat a
+    # marker as a block when the whole body is short (deny pages are tiny).
+    if len(body) < 2000:
+        low = body.lower()
+        for m in _BLOCK_MARKERS:
+            if m in low:
+                return f"marker:{m.strip()}"
+    return None
+
+
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    """Read `key` from an SDK object or a plain dict — web_fetch result blocks
+    surface as either depending on the installed anthropic SDK version."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+async def _tavily_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
+    """Re-fetch `url` via Tavily Extract. Returns a visit()-shaped dict, or None
+    when no key is set / transport fails / the body is empty."""
+    key = _tavily_key()
+    if not key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                "https://api.tavily.com/extract",
+                headers={"Authorization": f"Bearer {key}"},
+                json={"urls": [url], "extract_depth": "advanced",
+                      "format": "markdown"},
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("tavily fallback failed for %s: %s", url, str(e)[:120])
+        return None
+    results = data.get("results") or []
+    raw = (results[0].get("raw_content") or "").strip() if results else ""
+    if not raw:
+        return None
+    return {
+        "url": url,
+        "title": "",
+        "domain": _domain(url),
+        "text": raw[:text_cap],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "source": "tavily",
+    }
+
+
+async def _anthropic_web_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
+    """Last-resort fetch via Anthropic's server-side web_fetch tool. The url is
+    placed in the user turn because web_fetch only retrieves URLs already
+    present in the conversation. Server-rendered HTML only (no JS); PDFs come
+    back base64 and are skipped here (use download_file for those). Returns a
+    visit()-shaped dict or None."""
+    client = await _anthropic()
+    if client is None:
+        return None
+    try:
+        resp = await client.messages.create(
+            model=_anthropic_model(),
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Use the web_fetch tool to fetch this URL, then reply "
+                    f"'done': {url}"
+                ),
+            }],
+            tools=[{
+                "type": "web_fetch_20250910",
+                "name": "web_fetch",
+                "max_uses": 1,
+                "max_content_tokens": 100_000,
+            }],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("anthropic web_fetch failed for %s: %s", url, str(e)[:120])
+        return None
+
+    for block in resp.content:
+        if _field(block, "type") != "web_fetch_tool_result":
+            continue
+        result = _field(block, "content")
+        rtype = _field(result, "type")
+        if rtype == "web_fetch_tool_error":
+            log.warning("anthropic web_fetch error for %s: %s", url,
+                        _field(result, "error_code", "?"))
+            return None
+        if rtype != "web_fetch_result":
+            continue
+        fetched_url = _field(result, "url", url) or url
+        doc = _field(result, "content")          # the document content block
+        src = _field(doc, "source")
+        if _field(src, "type") != "text":        # base64 PDF — not handled here
+            return None
+        text = (_field(src, "data", "") or "").strip()
+        if not text:
+            return None
+        return {
+            "url": fetched_url,
+            "title": (_field(doc, "title", "") or "")[:300],
+            "domain": _domain(fetched_url),
+            "text": text[:text_cap],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "source": "anthropic_web_fetch",
+        }
+    return None
+
+
+async def _fallback_fetch(url: str, *, text_cap: int,
+                          reason: str) -> dict[str, Any] | None:
+    """Run the fallback chain (Tavily → Anthropic web_fetch) for a url the
+    Chromium path couldn't read. Returns the first success (visit()-shaped,
+    tagged with `source` + `fallback_reason`) or None if all are unavailable."""
+    t0 = time.perf_counter()
+    out = await _tavily_fetch(url, text_cap=text_cap)
+    if out is None:
+        out = await _anthropic_web_fetch(url, text_cap=text_cap)
+    if out is not None:
+        out["fallback_reason"] = reason
+    _emit("fallback_fetch", t0, extra={
+        "ok": out is not None,
+        "via": (out or {}).get("source"),
+        "reason": reason,
+        "chars": len((out or {}).get("text") or ""),
+    })
+    return out
+
+
+# ============================================================================
 # visit — open a URL, return DOM text + screenshot. The atomic primitive
 # everything else builds on.
 # ============================================================================
@@ -302,12 +553,29 @@ async def visit(
 
     client_id = _current_client.get() or "anon"
     ctx = await _get_context(client_id)
+
+    def _finalize_fb(fb: dict[str, Any]) -> dict[str, Any]:
+        # Cache + shape a fallback result exactly like a normal visit() return.
+        if fb.get("text"):
+            _visit_cache[cache_key] = dict(fb)
+        _emit("visit", t0, extra={"chars": len(fb.get("text") or ""),
+                                   "via": fb.get("source")})
+        if return_screenshot_b64:
+            return fb
+        return {k: v for k, v in fb.items() if k != "screenshot_b64"}
+
     page = await ctx.new_page()
     try:
         try:
             await page.goto(url, wait_until="domcontentloaded",
                              timeout=timeout_ms)
         except Exception as e:  # noqa: BLE001
+            # Network-level failure (timeout, DNS, connection reset). Try the
+            # alternate fetch paths before giving up.
+            fb = await _fallback_fetch(url, text_cap=text_cap,
+                                        reason=f"goto:{str(e)[:40]}")
+            if fb is not None:
+                return _finalize_fb(fb)
             _emit("visit", t0, extra={"error": f"goto: {str(e)[:80]}"})
             return {"error": f"navigation failed: {e}", "url": url}
 
@@ -336,6 +604,17 @@ async def visit(
             text = await page.evaluate("() => document.body.innerText || ''")
         except Exception:
             text = ""
+
+        # Bot-wall / challenge detection. The page loaded with HTTP 200 but the
+        # body is a CDN deny notice, not content — re-fetch from other infra.
+        block_reason = _looks_blocked(title, text)
+        if block_reason:
+            fb = await _fallback_fetch(url_final, text_cap=text_cap,
+                                        reason=block_reason)
+            if fb is not None:
+                return _finalize_fb(fb)
+            # Fallbacks unavailable/failed — fall through and return the blocked
+            # page, but tag it (below) so it isn't mistaken for real content.
 
         # Scan the rendered DOM for download-shaped links. We CANNOT parse
         # these — Chromium just returns bytes and our toolkit has no Excel /
@@ -376,6 +655,10 @@ async def visit(
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         }
+        if block_reason:
+            # Fallbacks were unavailable or also failed; surface the block so
+            # the agent treats this as a wall rather than empty content.
+            out["blocked"] = block_reason
         if file_links:
             out["file_links"] = file_links
             # Per-format counts so the agent can scan at a glance.
@@ -533,6 +816,33 @@ async def act(
             text = await page.evaluate("() => document.body.innerText || ''")
         except Exception:
             text = ""
+
+        # If the final page is a CDN bot-wall, the interaction results are
+        # meaningless. Re-fetch the URL from other infra so the agent still gets
+        # the page's content — but flag clearly that the steps were NOT applied
+        # (a plain fetch can't replay dropdown/click/filter actions).
+        block_reason = _looks_blocked(title, text)
+        if block_reason:
+            fb = await _fallback_fetch(final_url, text_cap=20_000,
+                                        reason=block_reason)
+            if fb is not None and fb.get("text"):
+                out = await _sonnet_extract(fb, focus=focus)
+                out["step_results"] = step_results
+                out["final_url"] = fb.get("url", final_url)
+                out["degraded"] = (
+                    f"Live page was blocked ({block_reason}); the interaction "
+                    f"steps could NOT be applied. Returned a static fetch of the "
+                    f"URL via {fb.get('source')} — any dropdown/click/filter "
+                    f"results are not reflected. The target site must be "
+                    f"reachable from the browser to capture post-interaction state."
+                )
+                _emit("act", t0, extra={"steps": len(steps),
+                                         "via": fb.get("source"),
+                                         "degraded": True})
+                return out
+            # Fallbacks unavailable/failed — return the blocked extraction but
+            # tag it (below).
+
         try:
             png = await page.screenshot(type="png",
                                           full_page=full_page_screenshot)
@@ -557,6 +867,8 @@ async def act(
         out = await _sonnet_extract(synthetic_visited, focus=focus)
         out["step_results"] = step_results
         out["final_url"] = final_url
+        if block_reason:
+            out["blocked"] = block_reason
         if include_screenshot_in_response and shot_b64:
             out["screenshot_b64"] = shot_b64
         _emit("act", t0,
@@ -634,7 +946,11 @@ async def _sonnet_extract(visited: dict[str, Any], *, focus: str = "") -> dict[s
         "domain": visited.get("domain", ""),
         "fetched_at": visited["fetched_at"],
         "kind": "browser",
+        # Provenance: "browser" (Chromium), "tavily", or "anthropic_web_fetch".
+        "source": visited.get("source") or "browser",
     }
+    if visited.get("blocked"):
+        base["blocked"] = visited["blocked"]
     text = visited.get("text") or ""
     shot_b64 = visited.get("screenshot_b64")
 

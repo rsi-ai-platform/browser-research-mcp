@@ -52,6 +52,16 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN mkdir -p $PLAYWRIGHT_BROWSERS_PATH \
  && patchright install --with-deps chromium
 
+# ---- Optional: Camoufox engine (BROWSER_ENGINE=camoufox) --------------------
+# OFF by default to keep the image lean. To enable: uncomment this block AND the
+# matching runtime block below, rebuild, and deploy with BROWSER_ENGINE=camoufox.
+# Camoufox is a Firefox fork, so it pulls a one-time browser download (~150 MB).
+#
+# ENV CAMOUFOX_HOME=/opt/camoufox
+# RUN uv pip install --system --no-cache ".[camoufox]" \
+#  && mkdir -p $CAMOUFOX_HOME \
+#  && HOME=$CAMOUFOX_HOME python -m camoufox fetch
+
 
 # ---- Stage 2: slim runtime image -------------------------------------------
 FROM python:3.12-slim AS runtime
@@ -107,6 +117,19 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin/browser-research /usr/local/bin/browser-research
 COPY --from=builder /opt/playwright-browsers /opt/playwright-browsers
 RUN chown -R app:app /opt/playwright-browsers
+
+# ---- Optional: Camoufox runtime deps (pairs with the builder block above) ---
+# Uncomment to enable BROWSER_ENGINE=camoufox. Firefox needs a slightly
+# different system-lib set than Chromium, plus xvfb for HEADLESS=virtual. The
+# Python package rides along in site-packages (copied above); add native libs +
+# the fetched browser. Runs before `USER app`, i.e. still as root.
+#
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#       libgtk-3-0 libdbus-glib-1-2 libxt6 libx11-xcb1 xvfb \
+#  && rm -rf /var/lib/apt/lists/*
+# COPY --from=builder /opt/camoufox /opt/camoufox
+# RUN chown -R app:app /opt/camoufox
+# ENV HOME=/opt/camoufox
 
 USER app
 EXPOSE 7862
