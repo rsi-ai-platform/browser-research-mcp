@@ -50,6 +50,10 @@ env:
   # Secret Manager secret name backing the TAVILY_API_KEY env var (the Tavily
   # fetch fallback). See the deploy step for the one-time setup it requires.
   TAVILY_SECRET: tavily-api-key
+  # Playbooks: GCS bucket holding the editable playbooks JSON (hot-reloaded),
+  # and the Secret Manager secret backing ADMIN_TOKEN (gates /admin/playbooks).
+  PLAYBOOKS_BUCKET: browser-research-mcp-config
+  ADMIN_SECRET: browser-research-admin-token
 
 jobs:
   deploy:
@@ -107,6 +111,21 @@ jobs:
         # run high concurrency). --execution-environment=gen2 is the reliable tier
         # for headless Chromium. Unspecified settings (CPU, env vars) are
         # preserved from the current revision.
+        #
+        # ONE-TIME for the playbook admin/editable layer. The ADMIN_TOKEN secret
+        # MUST exist + be granted to the runtime SA or this step FAILS (same as
+        # TAVILY did). The bucket need NOT exist for the deploy to pass — the code
+        # falls back to in-repo defaults — but editing playbooks needs it + the
+        # SA's objectAdmin:
+        #   gcloud storage buckets create gs://$PLAYBOOKS_BUCKET --location=$REGION --project=$PROJECT_ID
+        #   printf %s "$(openssl rand -hex 24)" | gcloud secrets create $ADMIN_SECRET \
+        #     --data-file=- --replication-policy=automatic --project=$PROJECT_ID
+        #   RUNTIME_SA=$(gcloud run services describe $SERVICE --region=$REGION \
+        #     --project=$PROJECT_ID --format='value(spec.template.spec.serviceAccountName)')
+        #   gcloud secrets add-iam-policy-binding $ADMIN_SECRET \
+        #     --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor --project=$PROJECT_ID
+        #   gcloud storage buckets add-iam-policy-binding gs://$PLAYBOOKS_BUCKET \
+        #     --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectAdmin --project=$PROJECT_ID
         run: |
           gcloud run deploy $SERVICE \
             --image=$IMAGE_BASE:${{ github.sha }} \
@@ -114,7 +133,8 @@ jobs:
             --project=$PROJECT_ID \
             --execution-environment=$RUN_EXEC_ENV \
             --memory=$RUN_MEMORY \
-            --update-secrets=TAVILY_API_KEY=$TAVILY_SECRET:latest \
+            --update-env-vars=PLAYBOOKS_GCS_BUCKET=$PLAYBOOKS_BUCKET \
+            --update-secrets=TAVILY_API_KEY=$TAVILY_SECRET:latest,ADMIN_TOKEN=$ADMIN_SECRET:latest \
             --quiet
 
       - name: Smoke-test the deployed MCP
