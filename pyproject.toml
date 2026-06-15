@@ -35,6 +35,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.7"]
+# Optional alternate browser engine (BROWSER_ENGINE=camoufox). Not installed by
+# default, to keep the image lean. Also needs `python -m camoufox fetch` and
+# Firefox's system libs in the image. See README -> Browser engines.
+camoufox = ["camoufox[geoip]>=0.4"]
 
 [project.scripts]
 browser-research = "browser_research.__main__:main"
