@@ -63,7 +63,13 @@ def _anthropic_key() -> str | None:
 
 
 def _anthropic_model() -> str:
-    return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    # Haiku 4.5 supports vision and handles the fixed-schema structured
+    # extraction job (title/dateline/summary/key_facts/numeric_values/
+    # dates/tables_summary) at ~1/3 the Sonnet cost. The screenshot+text
+    # input is high-volume per call, so this is where the spend sat.
+    # Override via ANTHROPIC_MODEL=claude-sonnet-4-6 on Cloud Run if a
+    # specific page needs the bigger model for stubborn chart parsing.
+    return os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 
 
 def _tavily_key() -> str | None:
