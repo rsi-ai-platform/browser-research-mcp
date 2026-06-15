@@ -1820,6 +1820,120 @@ def _parse_pdf_sync(raw_bytes: bytes, pages: list[int] | None,
     }
 
 
+# ============================================================================
+# Economical, query-targeted reading. Instead of dumping a whole PDF / workbook
+# into context, scan it for the query terms and return only the matching pages
+# (PDF) or rows (spreadsheet/CSV) with a snippet — pdfgrep, built in. This is how
+# you answer "what's the April-2024 fiscal-deficit figure in this 200-page
+# Monthly Accounts PDF" without paying for 200 pages. A page/row matches when it
+# contains ALL whitespace-separated query tokens (case-insensitive).
+# ============================================================================
+
+def _query_tokens(query: str) -> list[str]:
+    return [t for t in re.split(r"\s+", (query or "").lower().strip()) if t]
+
+
+def _text_matches(text: str, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    low = text.lower()
+    return all(t in low for t in tokens)
+
+
+def _snippet(text: str, tokens: list[str], ctx: int = 240) -> str:
+    """A grep -C style window around the earliest matching token."""
+    low = text.lower()
+    hits = [low.find(t) for t in tokens if low.find(t) >= 0]
+    pos = min(hits) if hits else -1
+    if pos < 0:
+        return " ".join(text[:ctx].split())
+    start, end = max(0, pos - ctx // 2), min(len(text), pos + ctx // 2)
+    body = " ".join(text[start:end].split())
+    return ("…" if start > 0 else "") + body + ("…" if end < len(text) else "")
+
+
+def _grep_pdf_sync(raw_bytes: bytes, query: str, max_pages_scan: int = 400,
+                   max_matches: int = 40) -> dict[str, Any]:
+    import io as _io
+    try:
+        from pypdf import PdfReader
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"pypdf unavailable: {e}"}
+    try:
+        reader = PdfReader(_io.BytesIO(raw_bytes))
+        n = len(reader.pages)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"could not open PDF: {e}"}
+    tokens = _query_tokens(query)
+    matches: list[dict[str, Any]] = []
+    scanned = 0
+    for i in range(min(n, max_pages_scan)):
+        scanned += 1
+        try:
+            txt = reader.pages[i].extract_text() or ""
+        except Exception:  # noqa: BLE001
+            txt = ""
+        if txt and _text_matches(txt, tokens):
+            matches.append({"page": i + 1, "snippet": _snippet(txt, tokens)})
+            if len(matches) >= max_matches:
+                break
+    return {"matches": matches, "match_count": len(matches),
+            "page_count": n, "pages_scanned": scanned}
+
+
+def _grep_excel_sync(raw_bytes: bytes, query: str, sheet: str | None,
+                     max_matches: int = 80) -> dict[str, Any]:
+    import io as _io
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"openpyxl unavailable: {e}"}
+    try:
+        wb = load_workbook(filename=_io.BytesIO(raw_bytes), read_only=True,
+                           data_only=True)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"could not open Excel: {e}"}
+    tokens = _query_tokens(query)
+    targets = [sheet] if sheet and sheet in wb.sheetnames else wb.sheetnames
+    matches: list[dict[str, Any]] = []
+    for sn in targets:
+        ws = wb[sn]
+        header: list[str] = []
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            vals = [("" if v is None else str(v)) for v in row]
+            if i == 0:
+                header = vals
+            if _text_matches("\t".join(vals), tokens):
+                matches.append({"sheet": sn, "row_index": i + 1,
+                                "header": header, "row": vals})
+                if len(matches) >= max_matches:
+                    return {"matches": matches, "match_count": len(matches)}
+    return {"matches": matches, "match_count": len(matches)}
+
+
+def _grep_csv_sync(raw_bytes: bytes, query: str,
+                   max_matches: int = 80) -> dict[str, Any]:
+    import csv as _csv
+    tokens = _query_tokens(query)
+    text = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        dialect = _csv.Sniffer().sniff(text[:4096])
+    except Exception:  # noqa: BLE001
+        dialect = _csv.excel
+    header: list[str] = []
+    matches: list[dict[str, Any]] = []
+    for i, row in enumerate(_csv.reader(text.splitlines(), dialect=dialect)):
+        vals = [c.strip() for c in row]
+        if i == 0:
+            header = vals
+        if _text_matches("\t".join(vals), tokens):
+            matches.append({"sheet": "CSV", "row_index": i + 1,
+                            "header": header, "row": vals})
+            if len(matches) >= max_matches:
+                break
+    return {"matches": matches, "match_count": len(matches)}
+
+
 async def download_file(
     url: str,
     *,
@@ -1827,16 +1941,29 @@ async def download_file(
     pages: list[int] | None = None,
     max_rows_per_sheet: int = 200,
     max_pdf_pages: int = 30,
+    query: str | None = None,
+    max_matches: int = 40,
     use_proxy: bool = False,
 ) -> dict[str, Any]:
     """Download a URL and parse it as a spreadsheet (.xlsx/.xlsm/.xls/.csv/
     .tsv) or PDF. Format is auto-detected via content-type + magic bytes.
+
+    ECONOMICAL READING — pass `query` to grep instead of dumping the whole
+    file. The file is scanned for the query terms (ALL whitespace-separated
+    tokens must appear, case-insensitive) and ONLY matching pages (PDF) or rows
+    (xlsx/csv) come back, with a snippet. Use this for big Monthly-Accounts-style
+    PDFs / workbooks where you want one figure, not 200 pages. Without `query`,
+    behaviour is unchanged (full parse, capped).
 
     Returns one of:
       • Spreadsheet → {kind: "spreadsheet", url, domain, format,
                        sheets[], content, sheet_count, fetched_at}
       • PDF         → {kind: "pdf", url, domain, content, page_count,
                        pages_extracted, content_truncated, fetched_at}
+      • PDF search  → {kind: "pdf_search", url, domain, query, matches:[{page,
+                       snippet}], match_count, page_count, pages_scanned}
+      • Sheet search→ {kind: "spreadsheet_search", url, domain, query,
+                       matches:[{sheet, row_index, header, row}], match_count}
       • Error       → {error, error_kind, url, domain, ...}
 
     error_kind values: http_error, html_masquerade, truncated_body,
@@ -1924,6 +2051,18 @@ async def download_file(
                 "error_kind": "too_large",
                 "url": url, "domain": domain,
             }
+        if query:
+            g = await asyncio.to_thread(_grep_pdf_sync, r.content, query,
+                                         max_matches=max_matches)
+            if "error" in g:
+                _emit("download_file", t0, extra={"err": "pdf_grep"})
+                return {**g, "error_kind": "parse_error",
+                        "url": url, "domain": domain}
+            _emit("download_file", t0, extra={"fmt": "pdf_search",
+                                               "matches": g["match_count"]})
+            return {"kind": "pdf_search", "url": url, "domain": domain,
+                    "query": query, **g,
+                    "fetched_at": datetime.now(timezone.utc).isoformat()}
         parsed = await asyncio.to_thread(_parse_pdf_sync, r.content,
                                            pages, max_pdf_pages)
         if "error" in parsed:
@@ -1953,6 +2092,24 @@ async def download_file(
             "error_kind": "too_large",
             "url": url, "domain": domain,
         }
+
+    if query and (is_csv or is_xlsx or is_xls or _is_excel_url(url)
+                  or "excel" in ct or "spreadsheet" in ct):
+        if is_csv:
+            g = await asyncio.to_thread(_grep_csv_sync, r.content, query,
+                                         max_matches)
+        else:
+            g = await asyncio.to_thread(_grep_excel_sync, r.content, query,
+                                         sheet, max_matches)
+        if "error" in g:
+            _emit("download_file", t0, extra={"err": "sheet_grep"})
+            return {**g, "error_kind": "parse_error",
+                    "url": url, "domain": domain}
+        _emit("download_file", t0, extra={"fmt": "spreadsheet_search",
+                                           "matches": g["match_count"]})
+        return {"kind": "spreadsheet_search", "url": url, "domain": domain,
+                "query": query, **g,
+                "fetched_at": datetime.now(timezone.utc).isoformat()}
 
     if is_csv:
         parsed = await asyncio.to_thread(_parse_csv_sync, r.content,
@@ -1995,4 +2152,176 @@ async def download_file(
     }
     _emit("download_file", t0, extra={"fmt": parsed["format"],
                                         "sheets": parsed["sheet_count"]})
+    return out
+
+
+# ============================================================================
+# sitemap_probe — the cheapest discovery step, run BEFORE driving a page.
+# robots.txt + sitemap.xml often hand you the stable data URLs (JSON/CSV/XLSX
+# endpoints, the full URL inventory) directly, so you can download_file /
+# call_api them and skip the browser entirely.
+# ============================================================================
+
+_SITEMAP_FETCH_CAP_BYTES = 5 * 1024 * 1024   # 5 MB per sitemap document
+# URL shapes that usually point at fetchable data rather than an HTML page.
+_DATA_LIKE_EXT = (".json", ".csv", ".tsv", ".xlsx", ".xls", ".xml", ".pdf")
+
+
+def _parse_robots(text: str) -> dict[str, Any]:
+    """Pull Sitemap: and Disallow: directives out of a robots.txt body."""
+    sitemaps: list[str] = []
+    disallow: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k == "sitemap" and v:
+            sitemaps.append(v)
+        elif k == "disallow" and v:
+            disallow.append(v)
+    return {"sitemaps": sitemaps, "disallow": disallow[:50]}
+
+
+def _parse_sitemap_xml(text: str) -> list[str]:
+    """Return every <loc> URL — works for both a <urlset> and a
+    <sitemapindex> (the caller decides which by whether the locs are .xml)."""
+    return [m.strip() for m in
+            re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text, flags=re.IGNORECASE)]
+
+
+def _decode_sitemap_bytes(raw: bytes, url: str) -> str:
+    """Decode a sitemap body to text, transparently gunzipping a .xml.gz (by
+    extension or gzip magic bytes) — httpx only auto-decompresses transport
+    Content-Encoding, not a gzipped sitemap *file*."""
+    if raw[:2] == b"\x1f\x8b" or url.lower().endswith(".gz"):
+        try:
+            import gzip as _gz
+            raw = _gz.decompress(raw)
+        except Exception:  # noqa: BLE001
+            return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _is_html_doc(text: str) -> bool:
+    """True if the body is an HTML page (e.g. an SPA app-shell served at
+    /sitemap.xml) rather than real sitemap XML — so the caller can say so
+    instead of silently returning zero URLs."""
+    head = text.lstrip()[:200].lower()
+    return (head.startswith("<!doctype html") or head.startswith("<html")
+            or "<html" in head)
+
+
+def _is_data_like(url: str) -> bool:
+    low = url.lower()
+    return low.endswith(_DATA_LIKE_EXT) or "/api/" in low or low.endswith("/api")
+
+
+async def sitemap_probe(
+    url: str,
+    *,
+    max_urls: int = 200,
+    max_sitemaps: int = 6,
+    use_proxy: bool = False,
+) -> dict[str, Any]:
+    """Read robots.txt + sitemap(s) for a site and surface its URL inventory,
+    highlighting data-like endpoints (.json/.csv/.xlsx/.xml/.pdf, /api/).
+
+    Returns:
+        {origin, robots_found, robots: {sitemaps[], disallow[]},
+         sitemaps_fetched[], url_count, data_like_urls[], urls[], notes}
+    """
+    t0 = time.perf_counter()
+    if not url:
+        return {"error": "url is required"}
+    pu = urlparse(url)
+    origin = f"{pu.scheme or 'https'}://{pu.netloc}"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/127.0.0.0 Safari/537.36"),
+        "Accept": "text/plain, application/xml, text/xml, */*;q=0.8",
+    }
+    proxy_url = _httpx_proxy_url() if use_proxy else None
+    notes: list[str] = []
+    robots: dict[str, Any] = {"sitemaps": [], "disallow": []}
+    robots_found = False
+    sitemap_queue: list[str] = []
+    seen_sitemaps: set[str] = set()
+    page_urls: list[str] = []
+    fetched: list[str] = []
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True,
+                                  headers=headers, proxy=proxy_url) as client:
+        # 1. robots.txt → Sitemap: directives (+ disallow as context).
+        try:
+            rr = await client.get(f"{origin}/robots.txt")
+            if rr.status_code < 400 and rr.text and "<html" not in \
+                    rr.text[:200].lower():
+                robots_found = True
+                robots = _parse_robots(rr.text)
+                sitemap_queue.extend(robots["sitemaps"])
+        except httpx.HTTPError as e:
+            notes.append(f"robots.txt fetch failed: {str(e)[:80]}")
+        # 2. Fall back to the conventional location if robots named none.
+        if not sitemap_queue:
+            sitemap_queue.append(f"{origin}/sitemap.xml")
+
+        # 3. Walk sitemaps (resolving one level of <sitemapindex>), bounded.
+        while sitemap_queue and len(fetched) < max_sitemaps:
+            sm = sitemap_queue.pop(0)
+            if sm in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sm)
+            try:
+                sr = await client.get(sm)
+            except httpx.HTTPError as e:
+                notes.append(f"sitemap fetch failed ({sm}): {str(e)[:60]}")
+                continue
+            if sr.status_code >= 400:
+                notes.append(f"sitemap {sm} → HTTP {sr.status_code}")
+                continue
+            body = _decode_sitemap_bytes(sr.content, sm)
+            if _is_html_doc(body):
+                notes.append(f"{sm} returned HTML, not XML — no usable sitemap "
+                             "here; use visit/file_links or call_api instead")
+                continue
+            body = body[:_SITEMAP_FETCH_CAP_BYTES]
+            fetched.append(sm)
+            locs = _parse_sitemap_xml(body)
+            # Child sitemaps (a sitemapindex) end in .xml/.xml.gz; queue them.
+            for loc in locs:
+                low = loc.lower()
+                if low.endswith(".xml") or low.endswith(".xml.gz"):
+                    if (loc not in seen_sitemaps
+                            and len(fetched) + len(sitemap_queue) < max_sitemaps):
+                        sitemap_queue.append(loc)
+                else:
+                    page_urls.append(loc)
+            if len(page_urls) >= max_urls * 4:
+                notes.append("URL inventory truncated (large sitemap)")
+                break
+
+    # Dedup, cap, classify.
+    deduped: list[str] = list(dict.fromkeys(page_urls))
+    data_like = [u for u in deduped if _is_data_like(u)][: max_urls]
+    out = {
+        "origin": origin,
+        "robots_found": robots_found,
+        "robots": robots,
+        "sitemaps_fetched": fetched,
+        "url_count": len(deduped),
+        "data_like_urls": data_like,
+        "urls": deduped[:max_urls],
+        "notes": notes,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data_like:
+        out["hint"] = ("data-like URLs found — download_file (.xlsx/.csv/.pdf) "
+                       "or call_api (/api, .json) these directly; skip the "
+                       "browser.")
+    _emit("sitemap_probe", t0, extra={"urls": len(deduped),
+                                       "data_like": len(data_like),
+                                       "sitemaps": len(fetched)})
     return out

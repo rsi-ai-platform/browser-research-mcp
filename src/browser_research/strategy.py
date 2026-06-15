@@ -28,6 +28,12 @@ RESEARCH_STRATEGY: dict[str, Any] = {
         "on a specific signal — never retry the move that just failed."
     ),
     "ladder": [
+        {"rung": 0, "name": "map the site (optional, cheap)",
+         "when": "Unsure where the data lives, or the site likely publishes it "
+                 "as files / a JSON API. Costs one HTTP call, no browser.",
+         "tool": "sitemap_probe",
+         "next_if_fails": "data_like_urls found → download_file / call_api them "
+                          "directly; otherwise proceed to rung 1."},
         {"rung": 1, "name": "static fetch",
          "when": "Default. Server-rendered HTML/PDF — the data is in the markup.",
          "tool": "(upstream) web_fetch / pdf_fetch / http_post_form",
@@ -79,8 +85,9 @@ RESEARCH_STRATEGY: dict[str, Any] = {
                "the endpoint"},
         {"signal": "blocked",
          "means": "CDN bot-wall (200-OK deny/challenge body)",
-         "do": "fallback fetch already ran; if still no content use "
-               "playbook.open_data or a non-datacenter IP"},
+         "do": "fallback fetch already ran; retry with use_proxy=true (if "
+               "BROWSER_PROXY_* is configured — datacenter egress is the usual "
+               "cause), else use playbook.open_data"},
         {"signal": "auth_wall",
          "means": "data/download gated behind login or registration",
          "do": "do NOT try to log in; pivot to playbook.open_data (open mirror "
@@ -120,6 +127,9 @@ STRATEGY_INSTRUCTIONS = (
     "APPROACH — how to attack ANY page (simple or hard). Classify it, take the "
     "cheapest rung that works, escalate on a SPECIFIC signal, never retry the "
     "move that just failed:\n"
+    "  0. sitemap_probe (optional, one cheap HTTP call) — when unsure where the "
+    "data lives; often returns data_like_urls (.csv/.xlsx/.json/.pdf, /api) to "
+    "download_file/call_api directly, no browser.\n"
     "  1. static fetch (upstream web_fetch/pdf_fetch) — server-rendered HTML/PDF.\n"
     "  2. visit — JS shell / SPA / canvas chart / JS-populated table.\n"
     "  3. act — data behind a click/dropdown/tab/submit (URL doesn't change).\n"

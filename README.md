@@ -18,7 +18,8 @@ web_search → web_fetch → pdf_fetch → http_post_form → browser-research
 | `visit(url, …)` | Open a URL with Chromium, return DOM text + screenshot. Cheap, no LLM call. |
 | `act(url, steps, …)` | Drive clicks/fills/selects/`fetch_json` through a flow, then Sonnet-extract. Auto-captures the page's XHR/fetch → `observed_api` + a `recovery_hint` when a UI step fails. |
 | `extract(url, focus, …)` | `visit` + Sonnet structured extraction. Same response shape as `pdf_fetch_structured`. Sends the screenshot to Sonnet so chart values drawn via canvas/SVG get picked up. |
-| `download_file(url, …)` | Download + parse a `.xlsx/.xlsm/.xls/.csv/.tsv/.pdf` end-to-end. |
+| `download_file(url, query?, …)` | Download + parse a `.xlsx/.xlsm/.xls/.csv/.tsv/.pdf` end-to-end. Pass `query` to grep (pdfgrep-style) and get back only the matching pages/rows + snippets — not the whole 200-page file. |
+| `sitemap_probe(url, …)` | Read robots.txt + sitemap(s); surface data-like URLs (`.csv/.xlsx/.json/.pdf`, `/api`) to fetch directly. Cheapest discovery step. |
 | `inspect_network(url, steps?, …)` | **Discover** the AJAX endpoint(s) a JS dashboard fires — method, params, response sample. |
 | `call_api(url, method, body, …)` | **Replay** a data endpoint directly from the page's own origin. Reaches data the UI never exposes. |
 | `strategy()` | Return the decision procedure — escalation ladder + signal→action table + principles. |
@@ -92,6 +93,8 @@ ANTHROPIC_API_KEY=… uvx browser-research --transport streamable-http --port 78
 | `ANTHROPIC_API_KEY` | for `extract` (not `visit`); also powers the `web_fetch` fallback | — |
 | `ANTHROPIC_MODEL` | no | `claude-sonnet-4-6` |
 | `TAVILY_API_KEY` | no — enables the 1st fetch fallback when a CDN bot-blocks Chromium | — |
+| `BROWSER_PROXY_SERVER` | no — residential/ISP proxy for `use_proxy` calls (e.g. `http://gw.proxy.net:7000`); the egress IP is the dominant CDN-block signal | — |
+| `BROWSER_PROXY_USERNAME` / `BROWSER_PROXY_PASSWORD` | no — proxy auth | — |
 | `BROWSER_ENGINE` | no — `chromium` or `camoufox` (see below) | `chromium` |
 | `BROWSER_CHANNEL` | no — e.g. `chrome` for a real Google Chrome binary (must be in the image) instead of bundled Chromium | — |
 | `HEADLESS` | no | `true` (`false` headful; `virtual` = Xvfb, camoufox only) |
@@ -146,12 +149,17 @@ Hard sites get solved once, then the knowledge is cached as a **playbook** so th
 agent never re-explores. When `visit`/`act`/`extract`/`download_file`/
 `inspect_network`/`call_api` hits a URL matching a playbook, the result carries a
 `playbook` field — `strategy`, what to `avoid` (with the reason), an `open_data`
-source to use instead, the known-good `act_steps`, and/or an `api` recipe (a
-discovered endpoint + param template to replay with `call_api`). The agent is
+source to use instead, the known-good `act_steps`, an `api` recipe (a
+discovered endpoint + param template to replay with `call_api`), and/or a
+`proxy` flag (route this domain through the residential proxy — the seeded PIB
+entry sets it because Akamai blocks datacenter egress). The agent is
 told (in the server instructions) to follow it before exploring. The seeded PPAC
 entries ship with verified `api` recipes (`getGasConsumption`,
 `getConsumptionPetroleumProductsData`) so those dashboards are a single
-`call_api` away. Two reactive flags compose with it: `blocked` (CDN bot-wall)
+`call_api` away; the CGA entry routes you to the Monthly Accounts Dashboard
+`.xlsm` (skipping the homepage's ASP.NET month-picker postbacks) to read with
+`download_file(query=…)`; the PIB entry sets `proxy` because Akamai blocks
+datacenter egress. Two reactive flags compose with it: `blocked` (CDN bot-wall)
 and `auth_wall` (login/registration gate) → both mean "stop driving the page,
 use the playbook's open source."
 

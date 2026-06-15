@@ -36,6 +36,20 @@ def _attach_next_step(result: dict[str, Any], tool: str) -> dict[str, Any]:
     return result
 
 
+async def _resolve_proxy(url: str, explicit: bool | None) -> bool:
+    """Decide whether a call routes through the residential proxy. An explicit
+    use_proxy from the caller wins; otherwise honour the matched playbook's
+    `proxy` hint (so domains known to block datacenter egress auto-proxy)."""
+    if explicit is not None:
+        return explicit
+    try:
+        pb = await playbooks.match_for_url(url)
+        return bool(pb and pb.get("proxy"))
+    except Exception as e:  # noqa: BLE001
+        log.debug("proxy resolve failed: %s", e)
+        return False
+
+
 async def _attach_playbook(result: dict[str, Any], url: str,
                            tool: str = "") -> dict[str, Any]:
     """If `url` matches a domain playbook, ride the recipe along in the result
@@ -81,6 +95,10 @@ mcp = FastMCP(
         "    what you call on every entry in the `file_links` array that "
         "    `visit` / `act` surface — DO NOT `visit` a file URL, it will "
         "    just stream binary.\n"
+        "  - `sitemap_probe(url)`: read robots.txt + sitemap(s); surfaces "
+        "    data_like_urls (.csv/.xlsx/.json/.pdf, /api) you can fetch "
+        "    directly. Cheapest discovery step — run it when unsure where the "
+        "    data lives.\n"
         "  - `inspect_network(url, steps?)`: open the page (optionally running "
         "    act-style steps) and report the XHR/fetch calls it fires — "
         "    endpoint, method, request params, response sample. The DISCOVERY "
@@ -109,10 +127,20 @@ mcp = FastMCP(
         "numbers ONLY as Excel / PDF attachments (GST at "
         "gst.gov.in/download/gststatistics, CGA monthly accounts, MoSPI "
         "Excel press kits, RBI circulars). For these:\n"
-        "  1. `visit` the index page to surface `file_links`.\n"
-        "  2. Pick the entry whose anchor text matches your target period.\n"
-        "  3. `download_file` on its href.\n"
-        "  4. Read the `sheets[].sample` (or PDF `content`) for the answer.\n"
+        "  1. `visit` (or `sitemap_probe`) the index to surface `file_links` / "
+        "data_like_urls.\n"
+        "  2. Pick the entry whose anchor text matches your objective — the "
+        "right PERIOD (month/quarter/FY), the right SCOPE (state/union/scheme), "
+        "and the right FORMAT (xlsx when you need cells, pdf when it's a "
+        "report). Don't download all of them; choose the one that answers the "
+        "task.\n"
+        "  3. `download_file` on its href. For a BIG file where you need a "
+        "specific figure, pass `query` (e.g. 'fiscal deficit April 2024') — it "
+        "greps the PDF/sheet and returns ONLY matching pages/rows + snippets, "
+        "not the whole 200-page document. Economical and faster.\n"
+        "  4. Read the matches (or `sheets[].sample` / PDF `content` for a full "
+        "parse) for the answer; widen the query or take a full parse if a match "
+        "is ambiguous.\n"
         "Do not bounce the user to another MCP for file parsing — that is "
         "now this MCP's job too.\n\n"
         "PLAYBOOKS: a tool result may include a `playbook` field — a verified "
@@ -123,6 +151,11 @@ mcp = FastMCP(
         "already. Also watch for `blocked` (CDN bot-wall) and `auth_wall` "
         "(login/registration gate) flags: both mean STOP driving the page and "
         "pivot to the playbook's open-data source.\n\n"
+        "PROXY: every browser tool + download_file takes `use_proxy`. Leave it "
+        "unset (None) to auto-honour the matched playbook's `proxy` hint; set "
+        "true to force the residential proxy (BROWSER_PROXY_* env) on a "
+        "`blocked` retry — a datacenter egress IP is the usual cause of an "
+        "enterprise-CDN wall.\n\n"
         + strategy_module.STRATEGY_INSTRUCTIONS
     ),
 )
@@ -189,6 +222,7 @@ async def visit(
     full_page_screenshot: bool = False,
     text_cap: int = 30000,
     return_screenshot_b64: bool = False,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Open a URL with a real Chromium and return its rendered state.
@@ -228,6 +262,7 @@ async def visit(
         full_page_screenshot=full_page_screenshot,
         text_cap=text_cap,
         return_screenshot_b64=return_screenshot_b64,
+        use_proxy=await _resolve_proxy(url, use_proxy),
     )
     return await _attach_playbook(result, url, tool="visit")
 
@@ -239,6 +274,7 @@ async def act(
     focus: str = "",
     timeout_ms: int = 60000,
     full_page_screenshot: bool = True,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Drive a real Chromium through a sequence of steps, then run Sonnet
@@ -305,6 +341,7 @@ async def act(
         focus=focus,
         timeout_ms=timeout_ms,
         full_page_screenshot=full_page_screenshot,
+        use_proxy=await _resolve_proxy(url, use_proxy),
     )
     return await _attach_playbook(result, url, tool="act")
 
@@ -315,6 +352,7 @@ async def extract(
     focus: str = "",
     wait_for_selector: str | None = None,
     full_page_screenshot: bool = True,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Visit a URL → focused Sonnet structured extraction.
@@ -341,6 +379,7 @@ async def extract(
         focus=focus,
         wait_for_selector=wait_for_selector,
         full_page_screenshot=full_page_screenshot,
+        use_proxy=await _resolve_proxy(url, use_proxy),
     )
     return await _attach_playbook(result, url, tool="extract")
 
@@ -352,6 +391,9 @@ async def download_file(
     pages: list[int] | None = None,
     max_rows_per_sheet: int = 200,
     max_pdf_pages: int = 30,
+    query: str | None = None,
+    max_matches: int = 40,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Download a file URL and parse its contents end-to-end.
@@ -392,8 +434,46 @@ async def download_file(
         pages=pages,
         max_rows_per_sheet=max_rows_per_sheet,
         max_pdf_pages=max_pdf_pages,
+        query=query,
+        max_matches=max_matches,
+        use_proxy=await _resolve_proxy(url, use_proxy),
     )
     return await _attach_playbook(result, url, tool="download_file")
+
+
+@mcp.tool()
+async def sitemap_probe(
+    url: str,
+    max_urls: int = 200,
+    max_sitemaps: int = 6,
+    use_proxy: bool | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Read a site's robots.txt + sitemap(s) and surface its URL inventory —
+    the CHEAPEST discovery step, run BEFORE driving a page.
+
+    robots.txt and sitemap.xml frequently hand you the stable data URLs
+    directly: a `data_like_urls` list of .json/.csv/.xlsx/.xml/.pdf and /api
+    endpoints you can `download_file` or `call_api` straight away, skipping the
+    browser entirely. Also returns the disallow list (where automation is
+    unwelcome) and the broader URL inventory for locating the right page.
+
+    Args:
+        url: Any URL on the target site (only its origin is used).
+        max_urls: Cap on the returned URL inventory.
+        max_sitemaps: Cap on sitemap documents fetched (resolves one level of
+            sitemap-index).
+
+    Returns:
+        {origin, robots_found, robots: {sitemaps[], disallow[]},
+         sitemaps_fetched[], url_count, data_like_urls[], urls[], notes, hint?}
+    """
+    _bind(ctx)
+    result = await tools.sitemap_probe(
+        url, max_urls=max_urls, max_sitemaps=max_sitemaps,
+        use_proxy=await _resolve_proxy(url, use_proxy),
+    )
+    return await _attach_playbook(result, url, tool="sitemap_probe")
 
 
 @mcp.tool()
@@ -403,6 +483,7 @@ async def inspect_network(
     settle_ms: int = 2500,
     url_filter: str | None = None,
     timeout_ms: int = 60000,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Open a page and report the XHR/fetch (AJAX) calls it fires — the
@@ -436,7 +517,7 @@ async def inspect_network(
     _bind(ctx)
     result = await tools.inspect_network(
         url, steps=steps, settle_ms=settle_ms, url_filter=url_filter,
-        timeout_ms=timeout_ms,
+        timeout_ms=timeout_ms, use_proxy=await _resolve_proxy(url, use_proxy),
     )
     return await _attach_playbook(result, url, tool="inspect_network")
 
@@ -449,6 +530,7 @@ async def call_api(
     headers: dict[str, str] | None = None,
     page_url: str | None = None,
     content_type: str | None = None,
+    use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Replay an API/AJAX endpoint directly — the REPLAY half of the pattern.
@@ -483,6 +565,7 @@ async def call_api(
     return await tools.call_api(
         url, method=method, body=body, headers=headers, page_url=page_url,
         content_type=content_type,
+        use_proxy=await _resolve_proxy(page_url or url, use_proxy),
     )
 
 
