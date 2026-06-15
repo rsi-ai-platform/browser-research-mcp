@@ -16,6 +16,12 @@ An entry:
     "open_data": [              # the escape hatch, as fetchable URLs
         {"tool": "download_file", "url"|"url_pattern": "...", "note": "..."}],
     "act_steps": [ {<single-key action>}, ... ],   # known-good interaction recipe
+    "api": [                    # discovered AJAX endpoint(s) — replay via call_api
+        {"endpoint": "https://…", "method": "POST",
+         "params": {"financialYear": "<FY e.g. 2023-2024>", …},  # null if TBD
+         "note": "what it returns; reaches periods the UI never exposes"}],
+    "proxy": true,              # route this domain through the residential proxy
+                                # (BROWSER_PROXY_* env) — its egress IP is blocked
     "last_verified": "YYYY-MM-DD",
   }
 `match` requires `domain`; `path_prefix` and `path_regex` optionally narrow it.
@@ -43,16 +49,30 @@ DEFAULT_PLAYBOOKS: list[dict[str, Any]] = [
     {
         "id": "ppac-consumption",
         "match": {"domain": "ppac.gov.in", "path_prefix": "/consumption"},
-        "strategy": ("Do NOT drive the page UI. The year selector is a "
-                     "non-native JS widget (select_option/click time out) and "
-                     "the historical download is behind register+captcha. "
-                     "Fetch the open mirrors instead."),
+        "strategy": ("Don't fight the year selector — it's a non-native JS "
+                     "widget. Best path: replay the AJAX endpoint the table "
+                     "fires (see `api`) via call_api, templating the year. "
+                     "Discover its exact params once with inspect_network if "
+                     "they drift. The data.gov.in CSV mirror is the simplest "
+                     "fully-open fallback; the historical download is "
+                     "register+captcha gated."),
         "avoid": [
             "act/select on the year dropdown — it's a custom JS widget, not a "
             "native <select>; select_option will time out",
             "'Download Historical/Current Report' buttons — register + captcha "
             "gated (hard stop for automation)",
             "guessing ppac.gov.in/download.php?file=... paths blindly",
+        ],
+        "api": [
+            {"endpoint": "https://ppac.gov.in/AjaxController/"
+                         "getConsumptionPetroleumProductsData",
+             "method": "POST",
+             "params": None,
+             "note": "Form-encoded POST that powers the products-wise table "
+                     "(monthly + annual total, '000 MT). Run inspect_network "
+                     "on /consumption/products-wise after a year change to "
+                     "capture the exact param names, then replay via call_api "
+                     "for any FY — including ones absent from the dropdown."},
         ],
         "open_data": [
             {"tool": "download_file",
@@ -64,6 +84,33 @@ DEFAULT_PLAYBOOKS: list[dict[str, Any]] = [
                             "<id>_ICR_<Month>_<Year>_compressed.pdf",
              "note": "Monthly Industry Consumption Report (POL & NG) PDF — "
                      "open, no auth, carries current+prior-period comparisons"},
+        ],
+        "last_verified": "2026-06-16",
+    },
+    {
+        "id": "ppac-natural-gas-consumption",
+        "match": {"domain": "ppac.gov.in",
+                  "path_prefix": "/natural-gas/consumption"},
+        "strategy": ("The year dropdown lists only the last ~2 fiscal years and "
+                     "is a custom JS widget. Skip the UI entirely: replay the "
+                     "getGasConsumption endpoint (see `api`) via call_api — it "
+                     "returns every year on file, including ones the dropdown "
+                     "omits."),
+        "api": [
+            {"endpoint": "https://ppac.gov.in/AjaxController/getGasConsumption",
+             "method": "POST",
+             "params": {"financialYear": "<FY e.g. 2023-2024>",
+                        "reportBy": "4", "pageId": "138"},
+             "note": "Form-encoded POST → JSON. result is rows keyed by index; "
+                     "each row has april…march + total in MMSCM. Rows: Net "
+                     "Production, LNG import, Total Consumption (= Net "
+                     "Production + LNG import). Verified for FY2023-24 through "
+                     "FY2025-26; FY2023-24 is NOT in the dropdown but the API "
+                     "returns it."},
+        ],
+        "avoid": [
+            "driving the year <select> with act — non-native JS widget; "
+            "select_option times out",
         ],
         "last_verified": "2026-06-16",
     },
@@ -86,6 +133,9 @@ DEFAULT_PLAYBOOKS: list[dict[str, Any]] = [
             "retrying from a datacenter IP — Akamai returns a challenge_title "
             "'Access Denied' page no matter how the dropdown is driven",
         ],
+        # Akamai blocks our datacenter egress; route through the residential
+        # proxy (BROWSER_PROXY_* env) when one is configured.
+        "proxy": True,
         "open_data": [
             {"note": "Individual releases are static: "
                      "PressReleasePage.aspx?PRID=<id> — fetchable via "
@@ -222,10 +272,29 @@ def validate_playbooks(obj: Any) -> tuple[bool, str]:
                 re.compile(m["path_regex"])
             except re.error as ex:
                 return False, f"entry {i}: invalid path_regex: {ex}"
+        if "api" in e:
+            api = e["api"]
+            if not isinstance(api, list):
+                return False, f"entry {i}: api must be a list"
+            for j, rec in enumerate(api):
+                if not isinstance(rec, dict):
+                    return False, f"entry {i}: api[{j}] must be an object"
+                if not isinstance(rec.get("endpoint"), str) or not rec["endpoint"]:
+                    return False, (f"entry {i}: api[{j}].endpoint "
+                                   "(non-empty string) required")
+                if "method" in rec and not isinstance(rec["method"], str):
+                    return False, f"entry {i}: api[{j}].method must be a string"
+                if ("params" in rec and rec["params"] is not None
+                        and not isinstance(rec["params"], dict)):
+                    return False, (f"entry {i}: api[{j}].params must be an "
+                                   "object or null")
+        if "proxy" in e and not isinstance(e["proxy"], bool):
+            return False, f"entry {i}: proxy must be a boolean"
         if not any(e.get(k) for k in
-                   ("strategy", "avoid", "open_data", "act_steps")):
+                   ("strategy", "avoid", "open_data", "act_steps", "api",
+                    "proxy")):
             return False, (f"entry {i}: needs at least one of "
-                           "strategy/avoid/open_data/act_steps")
+                           "strategy/avoid/open_data/act_steps/api/proxy")
     return True, ""
 
 
@@ -279,5 +348,6 @@ async def match_for_url(url: str) -> dict[str, Any] | None:
 def for_agent(entry: dict[str, Any]) -> dict[str, Any]:
     """The agent-facing projection injected into tool results."""
     return {k: entry[k] for k in
-            ("id", "strategy", "avoid", "open_data", "act_steps", "last_verified")
+            ("id", "strategy", "avoid", "open_data", "act_steps", "api",
+             "proxy", "last_verified")
             if k in entry}
