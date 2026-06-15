@@ -149,3 +149,17 @@ def test_merge_overlay_overrides_and_extends():
 def test_merge_empty_overlay_is_defaults():
     assert playbooks._merge_playbooks(playbooks.DEFAULT_PLAYBOOKS, []) == \
         list(playbooks.DEFAULT_PLAYBOOKS)
+
+
+def test_save_caches_merged_not_raw_overlay(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(playbooks, "_save_to_gcs_sync", lambda e: None)
+    overlay = [{"id": "ppac-consumption",
+                "match": {"domain": "ppac.gov.in", "path_prefix": "/consumption"},
+                "strategy": "OVERRIDDEN"}]
+    asyncio.run(playbooks.save_playbooks(overlay))
+    cached = playbooks._cache["data"]
+    ids = {p["id"] for p in cached}
+    assert "cga-monthly-accounts" in ids   # code-default-only id still served
+    assert next(p for p in cached if p["id"] == "ppac-consumption")["strategy"] \
+        == "OVERRIDDEN"                      # overlay still wins per-id
