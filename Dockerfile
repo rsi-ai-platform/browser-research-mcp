@@ -67,7 +67,9 @@ RUN mkdir -p $PLAYWRIGHT_BROWSERS_PATH \
 FROM python:3.12-slim AS runtime
 WORKDIR /app
 
-# Same system libs as the builder — runtime Chromium needs them.
+# Same system libs as the builder — runtime Chromium needs them. The tail
+# (xvfb + libgtk-3-0/libatspi/libx* input+render) is the extra GUI/X11 set a
+# HEADFUL window needs beyond the headless subset, for the HEADFUL_RETRY rung.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
@@ -95,6 +97,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     xdg-utils \
     xvfb \
+    libgtk-3-0 \
+    libatspi2.0-0 \
+    libxshmfence1 \
+    libxcursor1 \
+    libxi6 \
+    libxrender1 \
+    libxtst6 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -r -u 1000 -ms /bin/bash app
 
