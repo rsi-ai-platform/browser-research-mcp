@@ -94,6 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
+    xvfb \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -r -u 1000 -ms /bin/bash app
 
