@@ -79,6 +79,10 @@ def _tavily_key() -> str | None:
     return os.environ.get("TAVILY_API_KEY") or None
 
 
+def _firecrawl_key() -> str | None:
+    return os.environ.get("FIRECRAWL_API_KEY") or None
+
+
 def _proxy_opts() -> dict[str, str] | None:
     """Playwright proxy dict from env, or None when unconfigured. The egress IP
     is the dominant block signal for enterprise CDNs (Akamai et al.) — a
@@ -685,13 +689,64 @@ async def _anthropic_web_fetch(url: str, *, text_cap: int) -> dict[str, Any] | N
     return None
 
 
+async def _firecrawl_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
+    """Re-fetch `url` via Firecrawl's /v2/scrape. Firecrawl renders JS server-
+    side AND routes through its own proxy pool, so it clears the JS-SPA + CDN-IP
+    blocks that defeat our Cloud Run Chromium (and that Tavily's lighter render /
+    web_fetch's no-JS path miss). Returns a visit()-shaped dict or None."""
+    key = _firecrawl_key()
+    if not key:
+        return None
+    try:
+        # JS render can take a while; give it room (Firecrawl's own default
+        # request timeout is 60s).
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            r = await client.post(
+                "https://api.firecrawl.dev/v2/scrape",
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                json={"url": url, "formats": ["markdown"],
+                      "onlyMainContent": True, "proxy": "auto",
+                      # India exit keeps geo/locale coherent with our contexts.
+                      "location": {"country": "IN"}},
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("firecrawl fallback failed for %s: %s", url, str(e)[:120])
+        return None
+    if not data.get("success"):
+        return None
+    d = data.get("data") or {}
+    md = (d.get("markdown") or "").strip()
+    if not md:
+        return None
+    meta = d.get("metadata") or {}
+    title = meta.get("title")
+    if isinstance(title, list):
+        title = title[0] if title else ""
+    final_url = meta.get("url") or meta.get("sourceURL") or url
+    return {
+        "url": final_url,
+        "title": (title or "")[:300],
+        "domain": _domain(final_url),
+        "text": md[:text_cap],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "source": "firecrawl",
+    }
+
+
 async def _fallback_fetch(url: str, *, text_cap: int,
                           reason: str) -> dict[str, Any] | None:
-    """Run the fallback chain (Tavily → Anthropic web_fetch) for a url the
-    Chromium path couldn't read. Returns the first success (visit()-shaped,
-    tagged with `source` + `fallback_reason`) or None if all are unavailable."""
+    """Run the fallback chain for a url the Chromium path couldn't read:
+    Firecrawl (JS render + proxy pool — most capable) → Tavily Extract →
+    Anthropic web_fetch. Each rung is opt-in via its API key; returns the first
+    success (visit()-shaped, tagged with `source` + `fallback_reason`) or None."""
     t0 = time.perf_counter()
-    out = await _tavily_fetch(url, text_cap=text_cap)
+    out = await _firecrawl_fetch(url, text_cap=text_cap)
+    if out is None:
+        out = await _tavily_fetch(url, text_cap=text_cap)
     if out is None:
         out = await _anthropic_web_fetch(url, text_cap=text_cap)
     if out is not None:
