@@ -766,12 +766,30 @@ def _ensure_xvfb() -> bool:
         log.warning("Xvfb not installed — headful retry unavailable")
         return False
     try:
-        _xvfb_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             ["Xvfb", ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        os.environ["DISPLAY"] = ":99"
-        return True
+        # Wait for Xvfb to create its display socket before any browser launches
+        # against :99 — otherwise Chromium races the not-yet-ready display and
+        # dies with "Target page, context or browser has been closed". Only set
+        # DISPLAY + publish the proc once the socket exists, so a failed start
+        # never leaves DISPLAY pointing at a dead display.
+        for _ in range(60):                           # up to ~6s
+            if os.path.exists("/tmp/.X11-unix/X99"):
+                _xvfb_proc = proc
+                os.environ["DISPLAY"] = ":99"
+                return True
+            if proc.poll() is not None:               # Xvfb died on startup
+                log.warning("Xvfb exited during startup — headful unavailable")
+                return False
+            time.sleep(0.1)
+        log.warning("Xvfb :99 not ready in time — headful unavailable")
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
     except Exception as e:  # noqa: BLE001
         log.warning("Xvfb start failed: %s", e)
         return False
@@ -791,8 +809,11 @@ async def _headful_render(url: str, *, text_cap: int) -> dict[str, Any] | None:
             browser = await _pw_instance.chromium.launch(
                 headless=False,
                 **({"channel": channel} if channel else {}),
+                # --disable-gpu: no GPU on Cloud Run; headful otherwise tries to
+                # init one and can crash the launch.
                 args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"],
+                      "--disable-blink-features=AutomationControlled",
+                      "--disable-gpu"],
             )
             ctx = await browser.new_context(
                 user_agent=("Mozilla/5.0 (X11; Linux x86_64) "
@@ -831,10 +852,11 @@ async def _headful_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
     headless-UA / missing window-chrome signals anti-bot vendors probe) — so it
     clears *fingerprint*-gated sites the headless pass can't. It does NOT change
     the egress IP, so it can't beat datacenter-IP blocks; _fallback_fetch only
-    invokes it for content/fingerprint blocks, never ERR_* network resets. Opt
-    out with HEADFUL_RETRY=false. Fully bounded + guarded: returns None on
-    disabled / no display / still-blocked / error / 40s timeout, so it can never
-    hang or break the fallback chain."""
+    invokes it for *content* blocks (challenge_title / marker:… / empty_body),
+    skipping goto: network failures (ERR_*/timeout) + auth walls. Opt out with
+    HEADFUL_RETRY=false. Fully bounded + guarded: returns None on disabled / no
+    display / still-blocked / error / 40s timeout, so it can never hang or break
+    the fallback chain."""
     if os.environ.get("HEADFUL_RETRY", "true").strip().lower() == "false":
         return None
     if not await asyncio.to_thread(_ensure_xvfb):
@@ -856,11 +878,13 @@ async def _fallback_fetch(url: str, *, text_cap: int,
     success (visit()-shaped, tagged with `source` + `fallback_reason`) or None."""
     t0 = time.perf_counter()
     out = None
-    # Headful retry FIRST — but only for content/fingerprint blocks. A network
-    # error (ERR_CONNECTION_RESET / ERR_TIMED_OUT …) is an IP-level block, and
-    # headful shares our egress IP, so it'd just reset the same way after a 25s
-    # wait. Skip it there and go straight to the off-box rungs (Firecrawl et al.).
-    if "ERR_" not in reason:
+    # Headful retry FIRST — but only for *content* blocks: the page loaded yet
+    # looks like a bot-wall / is JS-empty, where a real window may clear
+    # fingerprint/headless gating. These reasons come from _looks_blocked
+    # (challenge_title / marker:… / empty_body). Skip it for "goto:…" network
+    # failures (ERR_* or timeout — headful shares our egress IP, would fail the
+    # same way after a 25s wait) and auth walls (need a login, not a window).
+    if reason.startswith(("challenge_title", "marker:", "empty_body")):
         out = await _headful_fetch(url, text_cap=text_cap)
     if out is None:
         out = await _firecrawl_fetch(url, text_cap=text_cap)
