@@ -262,6 +262,38 @@ async def _get_context(client_id: str, proxied: bool = False) -> BrowserContext:
     return ctx
 
 
+# Resource throttling: abort media + web-font requests on every page. Neither
+# affects DOM text OR the screenshot's content, but they're often the bulk of
+# page weight — cutting them speeds up render and lets networkidle settle
+# sooner. Images are deliberately NOT blocked here: chart/canvas pages rely on
+# them for vision extraction (block images per-request only when no screenshot
+# is requested — a follow-up).
+_BLOCK_RESOURCE_TYPES = {"media", "font"}
+
+
+async def _block_heavy(route) -> None:
+    try:
+        if route.request.resource_type in _BLOCK_RESOURCE_TYPES:
+            await route.abort()
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await route.continue_()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _new_page(ctx):
+    """new_page + the resource throttle — used everywhere we open a page."""
+    page = await ctx.new_page()
+    try:
+        await page.route("**/*", _block_heavy)
+    except Exception:  # noqa: BLE001
+        pass
+    return page
+
+
 async def shutdown() -> None:
     """Graceful cleanup. Cloud Run signals SIGTERM ~10s before kill;
     server.py's lifespan hooks call this."""
@@ -990,7 +1022,7 @@ async def visit(
             return fb
         return {k: v for k, v in fb.items() if k != "screenshot_b64"}
 
-    page = await ctx.new_page()
+    page = await _new_page(ctx)
     try:
         try:
             await page.goto(url, wait_until="domcontentloaded",
@@ -1017,7 +1049,7 @@ async def visit(
             # Best-effort: wait for network to idle, but don't block the
             # whole call if a single tracker pixel hangs.
             try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
+                await page.wait_for_load_state("networkidle", timeout=4_000)
             except Exception:
                 pass
 
@@ -1206,7 +1238,7 @@ async def act(
 
     client_id = _current_client.get() or "anon"
     ctx = await _get_context(client_id, proxied=use_proxy)
-    page = await ctx.new_page()
+    page = await _new_page(ctx)
     # Record the XHR/fetch the page fires while we drive it. Even if a UI step
     # times out (a non-native JS widget, say), the captured endpoint lets the
     # agent pivot to call_api instead of giving up.
@@ -1559,7 +1591,7 @@ async def call_api(
               f"{parsed_u.scheme or 'https'}://{parsed_u.netloc}/")
     client_id = _current_client.get() or "anon"
     ctx = await _get_context(client_id, proxied=use_proxy)
-    page = await ctx.new_page()
+    page = await _new_page(ctx)
     try:
         try:
             await page.goto(origin, wait_until="domcontentloaded",
@@ -1629,7 +1661,7 @@ async def inspect_network(
         return {"error": "url is required"}
     client_id = _current_client.get() or "anon"
     ctx = await _get_context(client_id, proxied=use_proxy)
-    page = await ctx.new_page()
+    page = await _new_page(ctx)
     rec = _NetworkRecorder(max_entries=max_entries, body_cap=body_cap)
     rec.attach(page)
     step_results: list[dict[str, Any]] = []
@@ -1641,7 +1673,7 @@ async def inspect_network(
             _emit("inspect_network", t0, extra={"error": f"goto:{str(e)[:60]}"})
             return {"error": f"navigation failed: {e}", "url": url}
         try:
-            await page.wait_for_load_state("networkidle", timeout=8_000)
+            await page.wait_for_load_state("networkidle", timeout=4_000)
         except Exception:  # noqa: BLE001
             pass
         for idx, step in enumerate(steps or []):
