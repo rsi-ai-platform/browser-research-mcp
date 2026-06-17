@@ -143,9 +143,12 @@ RUN chown -R app:app /opt/playwright-browsers
 
 USER app
 EXPOSE 7862
-# Run under xvfb-run so a virtual X display (and DISPLAY) exist from process
-# start — BEFORE the Playwright driver spawns. The headful retry rung
+# Start a virtual X display, then `exec` the app — so DISPLAY exists from
+# process start, BEFORE the Playwright driver spawns. The headful retry rung
 # (HEADFUL_RETRY) launches a real Chromium window, which needs an X server;
 # setting DISPLAY later in-process is too late (the driver already captured its
 # env). Headless mode ignores DISPLAY, so this is transparent to normal visits.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24 -nolisten tcp", "browser-research"]
+# We run Xvfb directly (not xvfb-run) to avoid the xauth dependency; `-ac`
+# disables access control so the local browser connects with no auth cookie.
+# `exec` keeps the app as PID 1 so it receives Cloud Run's SIGTERM directly.
+CMD ["sh", "-c", "mkdir -p /tmp/.X11-unix; export DISPLAY=:99; Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac >/dev/null 2>&1 & exec browser-research"]
