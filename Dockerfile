@@ -143,4 +143,9 @@ RUN chown -R app:app /opt/playwright-browsers
 
 USER app
 EXPOSE 7862
-CMD ["browser-research"]
+# Run under xvfb-run so a virtual X display (and DISPLAY) exist from process
+# start — BEFORE the Playwright driver spawns. The headful retry rung
+# (HEADFUL_RETRY) launches a real Chromium window, which needs an X server;
+# setting DISPLAY later in-process is too late (the driver already captured its
+# env). Headless mode ignores DISPLAY, so this is transparent to normal visits.
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24 -nolisten tcp", "browser-research"]

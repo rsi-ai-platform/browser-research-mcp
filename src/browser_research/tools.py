@@ -751,10 +751,17 @@ async def _firecrawl_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
 
 
 def _ensure_xvfb() -> bool:
-    """Start a virtual framebuffer (Xvfb) once so a HEADFUL browser can open a
-    real window on a headless host like Cloud Run. Sets DISPLAY and returns True
-    when a display is available; False if Xvfb isn't installed or won't start
-    (headful retry then quietly no-ops). Best-effort, sync, called once."""
+    """Ensure a virtual framebuffer is available so a HEADFUL browser can open a
+    real window on a headless host. In production the container runs under
+    `xvfb-run` (see Dockerfile CMD), so DISPLAY is already set before the
+    Playwright driver starts — the fast path below just returns True. This
+    in-process Xvfb start is a fallback for environments not wrapped by
+    xvfb-run (e.g. local dev). Returns False if no display can be obtained, in
+    which case the headful retry quietly no-ops. Best-effort, sync, called once.
+
+    NOTE: starting Xvfb here only helps if it happens BEFORE the Playwright
+    driver process is spawned; once the driver is up it has already captured its
+    env. xvfb-run is therefore the reliable path on Cloud Run."""
     if os.environ.get("DISPLAY"):
         return True
     global _xvfb_proc
