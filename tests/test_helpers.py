@@ -331,6 +331,44 @@ def test_fallback_skips_headful_on_network_error(monkeypatch):
     assert called[0] == "firecrawl"         # straight to the off-box rungs
 
 
+def test_fallback_skips_headful_on_goto_timeout(monkeypatch):
+    import asyncio
+    called = []
+
+    async def hf(u, *, text_cap):
+        called.append("headful")
+        return None
+
+    async def fc(u, *, text_cap):
+        called.append("firecrawl")
+        return {"text": "FC", "source": "firecrawl", "url": u, "domain": "d",
+                "title": "", "fetched_at": "t", "current_date": "d"}
+
+    monkeypatch.setattr(tools, "_headful_fetch", hf)
+    monkeypatch.setattr(tools, "_firecrawl_fetch", fc)
+    # A goto timeout is a network failure too — headful (same egress IP) would
+    # just burn its own 25s goto, so the positive content-block gate skips it.
+    out = asyncio.run(tools._fallback_fetch(
+        "https://x", text_cap=10, reason="goto:Timeout 45000ms exceeded"))
+    assert "headful" not in called and out["source"] == "firecrawl"
+
+
+def test_fallback_runs_headful_on_marker_block(monkeypatch):
+    import asyncio
+    called = []
+
+    async def hf(u, *, text_cap):
+        called.append("headful")
+        return {"text": "HF", "source": "headful", "url": u, "domain": "d",
+                "title": "", "fetched_at": "t", "current_date": "d"}
+
+    monkeypatch.setattr(tools, "_headful_fetch", hf)
+    # marker:… reasons (from _looks_blocked) are content blocks → headful runs.
+    out = asyncio.run(tools._fallback_fetch(
+        "https://x", text_cap=10, reason="marker:access denied"))
+    assert called == ["headful"] and out["source"] == "headful"
+
+
 def test_fallback_tries_headful_first_on_content_block(monkeypatch):
     import asyncio
     called = []

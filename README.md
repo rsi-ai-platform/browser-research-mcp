@@ -141,8 +141,9 @@ from different infrastructure, in order:
    (`navigator.webdriver`, headless UA, missing window-chrome), so it clears
    *fingerprint*-gated sites the headless pass can't — "an actual browser usually
    beats the bot-wall." It shares our egress IP, though, so it's **only tried for
-   content/fingerprint blocks, never `ERR_*` network resets** (an IP-level block
-   resets headful the same way). Launched-and-closed per retry, serialized so only
+   content blocks** (the page loaded but looks like a bot-wall / is JS-empty) and
+   **skipped for `goto:` network failures (`ERR_*`/timeout) + auth walls** (an
+   IP-level block or login gate defeats headful the same way). Launched-and-closed per retry, serialized so only
    one extra browser is ever resident (bounded memory). Disable with
    `HEADFUL_RETRY=false`. Local/free — runs before the paid rungs.
 1. **Firecrawl `/scrape`** — needs `FIRECRAWL_API_KEY`; renders JS server-side
