@@ -865,7 +865,10 @@ async def _headful_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
         return await asyncio.wait_for(
             _headful_render(url, text_cap=text_cap), timeout=40.0)
     except Exception as e:  # noqa: BLE001
-        log.warning("headful retry failed for %s: %s", url, str(e)[:120])
+        # Keep a long slice: Playwright appends the browser's startup stderr
+        # (e.g. "error while loading shared libraries: lib*.so") AFTER the
+        # generic first line, which is what pinpoints a missing GUI lib.
+        log.warning("headful retry failed for %s: %s", url, str(e)[:1000])
         return None
 
 
