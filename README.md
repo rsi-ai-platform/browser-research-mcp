@@ -22,6 +22,7 @@ web_search → web_fetch → pdf_fetch → http_post_form → browser-research
 | `sitemap_probe(url, …)` | Read robots.txt + sitemap(s); surface data-like URLs (`.csv/.xlsx/.json/.pdf`, `/api`) to fetch directly. Cheapest discovery step. |
 | `inspect_network(url, steps?, …)` | **Discover** the AJAX endpoint(s) a JS dashboard fires — method, params, response sample. |
 | `call_api(url, method, body, …)` | **Replay** a data endpoint directly from the page's own origin. Reaches data the UI never exposes. |
+| `smart_fetch(url, focus)` | **Playbook-aware** one-call fetch — acts on the URL's playbook (replay its `api` templating params from `focus`, pull its `open_data`, else render). What the upstream web_fetch escalation calls. |
 | `strategy()` | Return the decision procedure — escalation ladder + signal→action table + principles. |
 
 ### Adaptiveness, built in
