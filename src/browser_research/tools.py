@@ -698,17 +698,18 @@ async def _firecrawl_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
     if not key:
         return None
     try:
-        # JS render can take a while; give it room (Firecrawl's own default
-        # request timeout is 60s).
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=45.0) as client:
             r = await client.post(
                 "https://api.firecrawl.dev/v2/scrape",
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"},
+                # NO `proxy`/`location`: they 500 with
+                # ERR_TUNNEL_CONNECTION_FAILED (the geo-proxy tier isn't on this
+                # plan). Firecrawl still fetches from its OWN IPs by default, so
+                # it bypasses our datacenter-IP block regardless. `timeout` caps
+                # the render so a hard site fails fast instead of hanging.
                 json={"url": url, "formats": ["markdown"],
-                      "onlyMainContent": True, "proxy": "auto",
-                      # India exit keeps geo/locale coherent with our contexts.
-                      "location": {"country": "IN"}},
+                      "onlyMainContent": True, "timeout": 30000},
             )
             r.raise_for_status()
             data = r.json()
