@@ -54,6 +54,8 @@ env:
   # and the Secret Manager secret backing ADMIN_TOKEN (gates /admin/playbooks).
   PLAYBOOKS_BUCKET: browser-research-mcp-config
   ADMIN_SECRET: browser-research-admin-token
+  # Firecrawl /scrape — the 1st fetch-fallback rung (JS render + proxy pool).
+  FIRECRAWL_SECRET: firecrawl-api-key
 
 jobs:
   deploy:
@@ -134,7 +136,7 @@ jobs:
             --execution-environment=$RUN_EXEC_ENV \
             --memory=$RUN_MEMORY \
             --update-env-vars=PLAYBOOKS_GCS_BUCKET=$PLAYBOOKS_BUCKET \
-            --update-secrets=TAVILY_API_KEY=$TAVILY_SECRET:latest,ADMIN_TOKEN=$ADMIN_SECRET:latest \
+            --update-secrets=TAVILY_API_KEY=$TAVILY_SECRET:latest,ADMIN_TOKEN=$ADMIN_SECRET:latest,FIRECRAWL_API_KEY=$FIRECRAWL_SECRET:latest \
             --quiet
 
       - name: Smoke-test the deployed MCP
