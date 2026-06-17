@@ -286,3 +286,67 @@ def test_fallback_skips_firecrawl_when_empty(monkeypatch):
     monkeypatch.setattr(tools, "_tavily_fetch", tv)
     out = asyncio.run(tools._fallback_fetch("https://x", text_cap=100, reason="r"))
     assert out["source"] == "tavily" and order == ["firecrawl", "tavily"]
+
+
+# --------------------------------------------------------------------------
+# Headful retry rung — real-window fallback for content/fingerprint blocks,
+# skipped for IP-level network resets (same egress IP → same failure).
+# --------------------------------------------------------------------------
+
+def test_headful_disabled_by_env(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("HEADFUL_RETRY", "false")
+    # Returns before touching Xvfb / launching a browser.
+    assert asyncio.run(tools._headful_fetch("https://x", text_cap=10)) is None
+
+
+def test_fallback_skips_headful_on_network_error(monkeypatch):
+    import asyncio
+    called = []
+
+    async def hf(u, *, text_cap):
+        called.append("headful")
+        return None
+
+    async def fc(u, *, text_cap):
+        called.append("firecrawl")
+        return None
+
+    async def tv(u, *, text_cap):
+        called.append("tavily")
+        return None
+
+    async def wf(u, *, text_cap):
+        called.append("web_fetch")
+        return None
+
+    monkeypatch.setattr(tools, "_headful_fetch", hf)
+    monkeypatch.setattr(tools, "_firecrawl_fetch", fc)
+    monkeypatch.setattr(tools, "_tavily_fetch", tv)
+    monkeypatch.setattr(tools, "_anthropic_web_fetch", wf)
+    asyncio.run(tools._fallback_fetch(
+        "https://x", text_cap=10,
+        reason="goto:Page.goto: net::ERR_CONNECTION_RESET at https://x"))
+    assert "headful" not in called          # IP-level block → headful skipped
+    assert called[0] == "firecrawl"         # straight to the off-box rungs
+
+
+def test_fallback_tries_headful_first_on_content_block(monkeypatch):
+    import asyncio
+    called = []
+
+    async def hf(u, *, text_cap):
+        called.append("headful")
+        return {"text": "HF", "source": "headful", "url": u, "domain": "d",
+                "title": "", "fetched_at": "t", "current_date": "d"}
+
+    async def fc(u, *, text_cap):
+        called.append("firecrawl")
+        return None
+
+    monkeypatch.setattr(tools, "_headful_fetch", hf)
+    monkeypatch.setattr(tools, "_firecrawl_fetch", fc)
+    out = asyncio.run(tools._fallback_fetch(
+        "https://x", text_cap=10, reason="challenge_title"))
+    assert out["source"] == "headful" and out["fallback_reason"] == "challenge_title"
+    assert called == ["headful"]            # headful won; off-box rungs not needed

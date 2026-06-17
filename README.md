@@ -100,6 +100,7 @@ ANTHROPIC_API_KEY=… uvx browser-research --transport streamable-http --port 78
 | `BROWSER_ENGINE` | no — `chromium` or `camoufox` (see below) | `chromium` |
 | `BROWSER_CHANNEL` | no — e.g. `chrome` for a real Google Chrome binary (must be in the image) instead of bundled Chromium | — |
 | `HEADLESS` | no | `true` (`false` headful; `virtual` = Xvfb, camoufox only) |
+| `HEADFUL_RETRY` | no — on a block, retry once in a real (non-headless) Chromium window under Xvfb; clears fingerprint/headless-gated sites. Launched-and-closed per retry (bounded memory). `false` to disable | `true` |
 | `PLAYBOOKS_GCS_BUCKET` | no — GCS bucket for editable, hot-reloaded playbooks | — (uses in-repo defaults) |
 | `PLAYBOOKS_GCS_OBJECT` | no — object key for the playbooks JSON | `config/playbooks.json` |
 | `PLAYBOOKS_TTL_SECONDS` | no — hot-reload interval | `60` |
@@ -135,14 +136,24 @@ first. When a CDN (Akamai, Cloudflare, Imperva) bot-blocks our egress IP and
 returns a 200-OK "Access Denied" / JS-challenge page, the same URL is re-fetched
 from different infrastructure, in order:
 
+0. **Headful retry** — re-render in a *real (non-headless) Chromium window* under
+   Xvfb. A genuine window trips far fewer headless-detection checks
+   (`navigator.webdriver`, headless UA, missing window-chrome), so it clears
+   *fingerprint*-gated sites the headless pass can't — "an actual browser usually
+   beats the bot-wall." It shares our egress IP, though, so it's **only tried for
+   content/fingerprint blocks, never `ERR_*` network resets** (an IP-level block
+   resets headful the same way). Launched-and-closed per retry, serialized so only
+   one extra browser is ever resident (bounded memory). Disable with
+   `HEADFUL_RETRY=false`. Local/free — runs before the paid rungs.
 1. **Firecrawl `/scrape`** — needs `FIRECRAWL_API_KEY`; renders JS server-side
-   **and** routes through its own proxy pool, so it clears JS-SPA + datacenter-IP
-   blocks the others can't. Most capable → tried first when configured.
+   **and** fetches from its own IP pool, so it clears JS-SPA + datacenter-IP
+   blocks the on-box browser can't.
 2. **Tavily Extract** — needs `TAVILY_API_KEY`; different egress IP, fast, light JS.
 3. **Anthropic `web_fetch`** — server-side fetch via the Messages API; reuses
    `ANTHROPIC_API_KEY`. Server-rendered HTML + PDFs only (no JS).
 
-Results carry a `source` field (`browser` / `tavily` / `anthropic_web_fetch`).
+Results carry a `source` field (`browser` / `headful` / `firecrawl` / `tavily` /
+`anthropic_web_fetch`).
 A page that stays blocked after all fallbacks is returned with a `blocked` flag
 rather than being mistaken for empty content. `act` cannot replay interaction
 steps through a static fallback, so when the live page is blocked it returns the

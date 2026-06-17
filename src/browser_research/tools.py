@@ -47,6 +47,12 @@ _camoufox_mgr: Any | None = None
 # explicitly-requested domains pay for the proxy.
 _contexts: dict[tuple[str, bool], BrowserContext] = {}
 _browser_lock = asyncio.Lock()
+# Headful (non-headless) retry: an Xvfb process providing a virtual display so a
+# real browser WINDOW can run on a headless host, and a lock so at most one
+# headful Chromium is resident at a time (it's launched-and-closed per retry, so
+# we never keep two browsers in memory). See _headful_fetch.
+_xvfb_proc: Any | None = None
+_headful_lock = asyncio.Lock()
 
 _anthropic_client: Any | None = None
 _anthropic_lock = asyncio.Lock()
@@ -259,7 +265,7 @@ async def _get_context(client_id: str, proxied: bool = False) -> BrowserContext:
 async def shutdown() -> None:
     """Graceful cleanup. Cloud Run signals SIGTERM ~10s before kill;
     server.py's lifespan hooks call this."""
-    global _browser, _pw_instance, _contexts, _camoufox_mgr
+    global _browser, _pw_instance, _contexts, _camoufox_mgr, _xvfb_proc
     for ctx in list(_contexts.values()):
         try:
             await ctx.close()
@@ -287,6 +293,12 @@ async def shutdown() -> None:
         except Exception:
             pass
         _pw_instance = None
+    if _xvfb_proc is not None:
+        try:
+            _xvfb_proc.terminate()
+        except Exception:
+            pass
+        _xvfb_proc = None
 
 
 # ============================================================================
@@ -738,14 +750,120 @@ async def _firecrawl_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
     }
 
 
+def _ensure_xvfb() -> bool:
+    """Start a virtual framebuffer (Xvfb) once so a HEADFUL browser can open a
+    real window on a headless host like Cloud Run. Sets DISPLAY and returns True
+    when a display is available; False if Xvfb isn't installed or won't start
+    (headful retry then quietly no-ops). Best-effort, sync, called once."""
+    if os.environ.get("DISPLAY"):
+        return True
+    global _xvfb_proc
+    if _xvfb_proc is not None and _xvfb_proc.poll() is None:
+        return True
+    import shutil
+    import subprocess
+    if not shutil.which("Xvfb"):
+        log.warning("Xvfb not installed — headful retry unavailable")
+        return False
+    try:
+        _xvfb_proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Xvfb start failed: %s", e)
+        return False
+
+
+async def _headful_render(url: str, *, text_cap: int) -> dict[str, Any] | None:
+    """Open `url` in a real (non-headless) Chromium window under Xvfb, launched
+    fresh and closed at the end so no second browser stays resident. Serialized
+    by _headful_lock → at most one headful browser in memory at a time."""
+    global _pw_instance
+    async with _headful_lock:
+        browser = None
+        try:
+            if _pw_instance is None:
+                _pw_instance = await async_playwright().start()
+            channel = os.environ.get("BROWSER_CHANNEL") or None
+            browser = await _pw_instance.chromium.launch(
+                headless=False,
+                **({"channel": channel} if channel else {}),
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+            ctx = await browser.new_context(
+                user_agent=("Mozilla/5.0 (X11; Linux x86_64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"),
+                locale="en-IN", timezone_id="Asia/Kolkata",
+                viewport={"width": 1440, "height": 900},
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            await page.wait_for_timeout(1500)
+            title = (await page.title()) or ""
+            text = await page.evaluate("() => document.body.innerText || ''")
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    if _looks_blocked(title, text) or len((text or "").strip()) < 32:
+        return None
+    return {
+        "url": url,
+        "title": title[:300],
+        "domain": _domain(url),
+        "text": (text or "")[:text_cap],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "source": "headful",
+    }
+
+
+async def _headful_fetch(url: str, *, text_cap: int) -> dict[str, Any] | None:
+    """Headful (non-headless) retry rung. A real browser WINDOW trips far fewer
+    headless-detection checks than the headless build (the navigator.webdriver /
+    headless-UA / missing window-chrome signals anti-bot vendors probe) — so it
+    clears *fingerprint*-gated sites the headless pass can't. It does NOT change
+    the egress IP, so it can't beat datacenter-IP blocks; _fallback_fetch only
+    invokes it for content/fingerprint blocks, never ERR_* network resets. Opt
+    out with HEADFUL_RETRY=false. Fully bounded + guarded: returns None on
+    disabled / no display / still-blocked / error / 40s timeout, so it can never
+    hang or break the fallback chain."""
+    if os.environ.get("HEADFUL_RETRY", "true").strip().lower() == "false":
+        return None
+    if not await asyncio.to_thread(_ensure_xvfb):
+        return None
+    try:
+        return await asyncio.wait_for(
+            _headful_render(url, text_cap=text_cap), timeout=40.0)
+    except Exception as e:  # noqa: BLE001
+        log.warning("headful retry failed for %s: %s", url, str(e)[:120])
+        return None
+
+
 async def _fallback_fetch(url: str, *, text_cap: int,
                           reason: str) -> dict[str, Any] | None:
     """Run the fallback chain for a url the Chromium path couldn't read:
+    headful retry (real browser window — only for content/fingerprint blocks) →
     Firecrawl (JS render + proxy pool — most capable) → Tavily Extract →
     Anthropic web_fetch. Each rung is opt-in via its API key; returns the first
     success (visit()-shaped, tagged with `source` + `fallback_reason`) or None."""
     t0 = time.perf_counter()
-    out = await _firecrawl_fetch(url, text_cap=text_cap)
+    out = None
+    # Headful retry FIRST — but only for content/fingerprint blocks. A network
+    # error (ERR_CONNECTION_RESET / ERR_TIMED_OUT …) is an IP-level block, and
+    # headful shares our egress IP, so it'd just reset the same way after a 25s
+    # wait. Skip it there and go straight to the off-box rungs (Firecrawl et al.).
+    if "ERR_" not in reason:
+        out = await _headful_fetch(url, text_cap=text_cap)
+    if out is None:
+        out = await _firecrawl_fetch(url, text_cap=text_cap)
     if out is None:
         out = await _tavily_fetch(url, text_cap=text_cap)
     if out is None:
