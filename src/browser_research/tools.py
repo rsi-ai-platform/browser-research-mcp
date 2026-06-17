@@ -1494,6 +1494,124 @@ async def inspect_network(
             pass
 
 
+# ============================================================================
+# smart_fetch — playbook-AWARE fetch. Don't just attach the playbook; ACT on it:
+# replay its `api` endpoint, pull its `open_data` mirror, else render. This is
+# what the upstream web_fetch escalation calls, so a known site resolves via its
+# recipe instead of a blind browser render.
+# ============================================================================
+
+_PLACEHOLDER_RE = re.compile(r"<[^>]*>")
+
+
+def _derive_fy(text: str) -> str | None:
+    """Pull an Indian fiscal year (YYYY-YYYY) out of free text — '2023-2024',
+    '2023-24', 'FY24', 'FY2024' (FY label = the year it ENDS). Returns None when
+    ambiguous (a bare 4-digit year) so callers fall back rather than guess."""
+    t = text or ""
+    m = re.search(r"(20\d\d)\s*[-/]\s*(20\d\d)", t)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.search(r"(20\d\d)\s*[-/]\s*(\d\d)\b", t)
+    if m:
+        return f"{m.group(1)}-20{m.group(2)}"
+    m = re.search(r"\bFY\s*(?:20)?(\d\d)\b", t, re.IGNORECASE)
+    if m:
+        end = 2000 + int(m.group(1))
+        return f"{end - 1}-{end}"
+    return None
+
+
+def _template_api_params(params: dict[str, Any] | None,
+                         focus: str) -> dict[str, Any] | None:
+    """Fill <placeholder> values in a playbook `api` param template from `focus`.
+    Today only fiscal-year-shaped params auto-fill; any other unresolved
+    placeholder returns None so the caller falls back to a safer rung."""
+    if not isinstance(params, dict):
+        return None
+    out: dict[str, Any] = {}
+    fy: str | None = None
+    for k, v in params.items():
+        if isinstance(v, str) and _PLACEHOLDER_RE.search(v):
+            kl = k.lower()
+            if "year" in kl or "fy" in kl or "financial" in kl:
+                fy = fy or _derive_fy(focus)
+                if not fy:
+                    return None
+                out[k] = fy
+            else:
+                return None
+        else:
+            out[k] = v
+    return out
+
+
+async def smart_fetch(url: str, *, focus: str = "",
+                      use_proxy: bool = False) -> dict[str, Any]:
+    """Playbook-aware fetch: consult the URL's playbook and ACT on it — replay
+    its `api` endpoint (templating params from `focus`), or pull its `open_data`
+    mirror — falling back to a full browser render (`extract`) when there's no
+    auto-executable recipe. Returns the `extract` structured shape plus
+    `rung_used` (api|open_data|render) and `playbook_id`."""
+    t0 = time.perf_counter()
+    if not url:
+        return {"error": "url is required"}
+    from . import playbooks as _pb
+    try:
+        pb = await _pb.match_for_url(url)
+    except Exception:  # noqa: BLE001
+        pb = None
+
+    if pb:
+        # (a) api recipe → call_api → structured extract over the JSON.
+        for api in (pb.get("api") or []):
+            endpoint = api.get("endpoint")
+            if not endpoint or api.get("params") is None:
+                continue
+            templated = _template_api_params(api.get("params"), focus)
+            if templated is None:
+                continue
+            try:
+                r = await call_api(endpoint, method=api.get("method", "GET"),
+                                   body=templated or None, page_url=url,
+                                   use_proxy=use_proxy)
+            except Exception:  # noqa: BLE001
+                continue
+            data = r.get("json") if isinstance(r, dict) else None
+            if data is not None:
+                out = await _sonnet_extract(
+                    {"url": url, "domain": _domain(url),
+                     "text": json.dumps(data, default=str)[:16000],
+                     "fetched_at": datetime.now(timezone.utc).isoformat()},
+                    focus=focus)
+                out.update(rung_used="api", playbook_id=pb.get("id"),
+                           api_endpoint=endpoint, api_params=templated)
+                _emit("smart_fetch", t0, extra={"rung": "api"})
+                return out
+        # (b) open_data: a concrete download_file URL (open mirror / auth pivot).
+        for od in (pb.get("open_data") or []):
+            u = od.get("url")
+            if u and (od.get("tool") or "download_file") == "download_file":
+                try:
+                    r = await download_file(u, query=(focus or None),
+                                            use_proxy=use_proxy)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(r, dict) and "error" not in r:
+                    r.update(rung_used="open_data", playbook_id=pb.get("id"))
+                    _emit("smart_fetch", t0, extra={"rung": "open_data"})
+                    return r
+
+    # (c) default → full browser render.
+    out = await extract(url, focus=focus, use_proxy=use_proxy)
+    if isinstance(out, dict):
+        out["rung_used"] = "render"
+        if pb:
+            out.setdefault("playbook_id", pb.get("id"))
+    _emit("smart_fetch", t0, extra={"rung": "render"})
+    return out
+
+
 async def _sonnet_extract(visited: dict[str, Any], *, focus: str = "") -> dict[str, Any]:
     """Shared LLM extraction over a `visited`-shaped payload. Used by extract()
     and act() so both produce identical output schemas."""

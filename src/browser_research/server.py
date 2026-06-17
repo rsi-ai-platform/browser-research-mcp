@@ -105,7 +105,10 @@ mcp = FastMCP(
         "    step for JS dashboards.\n"
         "  - `call_api(url, method, body)`: replay a data endpoint directly "
         "    from the page's own origin (cookies / CSRF / referer all match). "
-        "    The REPLAY step — reaches data the UI never exposes.\n\n"
+        "    The REPLAY step — reaches data the UI never exposes.\n"
+        "  - `smart_fetch(url, focus)`: playbook-AWARE one-call fetch — consults "
+        "    the URL's playbook and ACTS on it (replays its `api`, pulls its "
+        "    `open_data`, else renders). Prefer it when a site may have a recipe.\n\n"
         "API-REPLAY PATTERN — your sharpest tool for JS-dropdown dashboards "
         "(PPAC, RBI, NSE, MoSPI). When a Year/Month/State selector is a custom "
         "JS widget (so `act`'s select/click time out) the table is really fed "
@@ -608,6 +611,38 @@ async def call_api(
         content_type=content_type,
         use_proxy=await _resolve_proxy(page_url or url, use_proxy),
     )
+
+
+@mcp.tool()
+async def smart_fetch(
+    url: str,
+    focus: str = "",
+    use_proxy: bool | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Playbook-aware fetch — the one-call "do the right thing" entry point.
+
+    Consults the URL's playbook and ACTS on it instead of blindly rendering:
+      - `api` recipe present → replays the endpoint via call_api (templating the
+        params, e.g. the fiscal year, from `focus`), then structures the JSON.
+      - `open_data` mirror present → download_file's it (the open CSV/PDF — the
+        pivot for auth-walled or JS-dropdown sites).
+      - otherwise → falls back to a full browser render (`extract`).
+
+    Returns the `extract` structured shape (title/summary/key_facts/
+    numeric_values/dates/tables_summary) PLUS `rung_used` (api|open_data|render)
+    and `playbook_id`. Prefer this over `extract` whenever a site might have a
+    playbook recipe — it's what the upstream web_fetch escalation calls.
+
+    Args:
+        url: The page/endpoint URL.
+        focus: What you want (also supplies params like the year for `api`
+            recipes, e.g. "natural gas consumption FY2023-24").
+    """
+    _bind(ctx)
+    result = await tools.smart_fetch(
+        url, focus=focus, use_proxy=await _resolve_proxy(url, use_proxy))
+    return await _attach_playbook(result, url, tool="smart_fetch")
 
 
 # ============================================================================

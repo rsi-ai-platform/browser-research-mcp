@@ -163,3 +163,72 @@ def test_save_caches_merged_not_raw_overlay(monkeypatch):
     assert "cga-monthly-accounts" in ids   # code-default-only id still served
     assert next(p for p in cached if p["id"] == "ppac-consumption")["strategy"] \
         == "OVERRIDDEN"                      # overlay still wins per-id
+
+
+# --------------------------------------------------------------------------
+# smart_fetch — playbook-aware dispatch (api / open_data / render) + FY fill.
+# --------------------------------------------------------------------------
+
+def test_derive_fy():
+    assert tools._derive_fy("gas consumption 2023-2024") == "2023-2024"
+    assert tools._derive_fy("for 2023-24 please") == "2023-2024"
+    assert tools._derive_fy("FY24 numbers") == "2023-2024"
+    assert tools._derive_fy("FY2026") == "2025-2026"
+    assert tools._derive_fy("just 2024 alone") is None   # ambiguous → None
+
+
+def test_template_api_params():
+    base = {"financialYear": "<FY e.g. 2023-2024>", "reportBy": "4", "pageId": "138"}
+    assert tools._template_api_params(base, "natural gas 2023-24") == \
+        {"financialYear": "2023-2024", "reportBy": "4", "pageId": "138"}
+    assert tools._template_api_params(base, "natural gas") is None   # no FY
+    assert tools._template_api_params({"q": "<term>"}, "x") is None  # unfillable
+    assert tools._template_api_params({"a": "1"}, "x") == {"a": "1"}  # concrete
+
+
+def test_smart_fetch_acts_on_api_recipe(monkeypatch):
+    import asyncio
+    gas = next(p for p in playbooks.DEFAULT_PLAYBOOKS
+               if p["id"] == "ppac-natural-gas-consumption")
+    seen = {}
+
+    async def fake_match(u):
+        return gas
+
+    async def fake_call_api(endpoint, **k):
+        seen["body"] = k.get("body")
+        return {"json": {"result": {"x": 1}}}
+
+    async def fake_sonnet(visited, **k):
+        return {"summary": "structured", "key_facts": []}
+
+    async def fake_extract(url, **k):
+        seen["render"] = True
+        return {"summary": "rendered"}
+
+    monkeypatch.setattr(playbooks, "match_for_url", fake_match)
+    monkeypatch.setattr(tools, "call_api", fake_call_api)
+    monkeypatch.setattr(tools, "_sonnet_extract", fake_sonnet)
+    monkeypatch.setattr(tools, "extract", fake_extract)
+    out = asyncio.run(tools.smart_fetch(
+        "https://ppac.gov.in/natural-gas/consumption", focus="gas 2023-24"))
+    assert out["rung_used"] == "api"
+    assert out["playbook_id"] == "ppac-natural-gas-consumption"
+    assert seen["body"]["financialYear"] == "2023-2024"   # templated from focus
+    assert "render" not in seen                            # did NOT fall back
+
+
+def test_smart_fetch_render_fallback(monkeypatch):
+    import asyncio
+
+    async def fake_match(u):
+        return None
+
+    async def fake_extract(url, **k):
+        return {"summary": "rendered"}
+
+    monkeypatch.setattr(playbooks, "match_for_url", fake_match)
+    monkeypatch.setattr(tools, "extract", fake_extract)
+    out = asyncio.run(tools.smart_fetch("https://example.com/x", focus="hi"))
+    assert out["rung_used"] == "render"
+    assert "playbook_id" not in out
