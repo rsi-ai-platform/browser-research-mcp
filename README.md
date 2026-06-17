@@ -93,7 +93,8 @@ ANTHROPIC_API_KEY=… uvx browser-research --transport streamable-http --port 78
 |---|---|---|
 | `ANTHROPIC_API_KEY` | for `extract` (not `visit`); also powers the `web_fetch` fallback | — |
 | `ANTHROPIC_MODEL` | no | `claude-sonnet-4-6` |
-| `TAVILY_API_KEY` | no — enables the 1st fetch fallback when a CDN bot-blocks Chromium | — |
+| `FIRECRAWL_API_KEY` | no — Firecrawl /scrape fallback (1st rung: JS render + proxy pool) | — |
+| `TAVILY_API_KEY` | no — Tavily Extract fallback (2nd rung) | — |
 | `BROWSER_PROXY_SERVER` | no — residential/ISP proxy for `use_proxy` calls (e.g. `http://gw.proxy.net:7000`); the egress IP is the dominant CDN-block signal | — |
 | `BROWSER_PROXY_USERNAME` / `BROWSER_PROXY_PASSWORD` | no — proxy auth | — |
 | `BROWSER_ENGINE` | no — `chromium` or `camoufox` (see below) | `chromium` |
@@ -134,8 +135,11 @@ first. When a CDN (Akamai, Cloudflare, Imperva) bot-blocks our egress IP and
 returns a 200-OK "Access Denied" / JS-challenge page, the same URL is re-fetched
 from different infrastructure, in order:
 
-1. **Tavily Extract** — needs `TAVILY_API_KEY`; different egress IP, fast.
-2. **Anthropic `web_fetch`** — server-side fetch via the Messages API; reuses
+1. **Firecrawl `/scrape`** — needs `FIRECRAWL_API_KEY`; renders JS server-side
+   **and** routes through its own proxy pool, so it clears JS-SPA + datacenter-IP
+   blocks the others can't. Most capable → tried first when configured.
+2. **Tavily Extract** — needs `TAVILY_API_KEY`; different egress IP, fast, light JS.
+3. **Anthropic `web_fetch`** — server-side fetch via the Messages API; reuses
    `ANTHROPIC_API_KEY`. Server-rendered HTML + PDFs only (no JS).
 
 Results carry a `source` field (`browser` / `tavily` / `anthropic_web_fetch`).

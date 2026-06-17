@@ -232,3 +232,57 @@ def test_smart_fetch_render_fallback(monkeypatch):
     out = asyncio.run(tools.smart_fetch("https://example.com/x", focus="hi"))
     assert out["rung_used"] == "render"
     assert "playbook_id" not in out
+
+
+# --------------------------------------------------------------------------
+# Firecrawl fallback rung — opt-in, tried first when configured.
+# --------------------------------------------------------------------------
+
+def test_firecrawl_disabled_without_key(monkeypatch):
+    import asyncio
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    assert asyncio.run(tools._firecrawl_fetch("https://x.gov.in", text_cap=10)) is None
+
+
+def test_fallback_tries_firecrawl_first(monkeypatch):
+    import asyncio
+    order = []
+
+    async def fc(u, *, text_cap):
+        order.append("firecrawl")
+        return {"text": "FC", "source": "firecrawl", "url": u, "domain": "d",
+                "title": "", "fetched_at": "t", "current_date": "d"}
+
+    async def tv(u, *, text_cap):
+        order.append("tavily")
+        return None
+
+    async def wf(u, *, text_cap):
+        order.append("web_fetch")
+        return None
+
+    monkeypatch.setattr(tools, "_firecrawl_fetch", fc)
+    monkeypatch.setattr(tools, "_tavily_fetch", tv)
+    monkeypatch.setattr(tools, "_anthropic_web_fetch", wf)
+    out = asyncio.run(tools._fallback_fetch("https://x", text_cap=100, reason="r"))
+    assert out["source"] == "firecrawl" and out["fallback_reason"] == "r"
+    assert order == ["firecrawl"]   # firecrawl won; cheaper rungs not needed
+
+
+def test_fallback_skips_firecrawl_when_empty(monkeypatch):
+    import asyncio
+    order = []
+
+    async def fc(u, *, text_cap):
+        order.append("firecrawl")     # no key / empty
+        return None
+
+    async def tv(u, *, text_cap):
+        order.append("tavily")
+        return {"text": "TV", "source": "tavily", "url": u, "domain": "d",
+                "title": "", "fetched_at": "t", "current_date": "d"}
+
+    monkeypatch.setattr(tools, "_firecrawl_fetch", fc)
+    monkeypatch.setattr(tools, "_tavily_fetch", tv)
+    out = asyncio.run(tools._fallback_fetch("https://x", text_cap=100, reason="r"))
+    assert out["source"] == "tavily" and order == ["firecrawl", "tavily"]
