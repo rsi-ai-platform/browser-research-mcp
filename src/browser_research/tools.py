@@ -15,8 +15,10 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -2682,4 +2684,774 @@ async def sitemap_probe(
     _emit("sitemap_probe", t0, extra={"urls": len(deduped),
                                        "data_like": len(data_like),
                                        "sitemaps": len(fetched)})
+    return out
+
+
+# ============================================================================
+# External extraction fallback (Kryptos single-URL jobs) + GCS result fetch.
+# Use only when browser + API replay + file parsing paths are exhausted.
+# ============================================================================
+
+_KRYPTOS_DEFAULT_BASE_URL = "https://web-weaver-rsi.ngrok.pro"
+_KRYPTOS_DEFAULT_BUCKET = "single-url-data"
+_KRYPTOS_DEFAULT_PREFIX_ROOT = "data"
+_KRYPTOS_PROGRESS_POLL_S = 10
+_GCS_TEXT_EXT = (
+    ".json", ".txt", ".md", ".csv", ".tsv", ".xml", ".html",
+    ".yaml", ".yml", ".log",
+)
+
+
+def _slug_job_name(name: str) -> str:
+    """Filesystem-safe-ish job name; aligns with Kryptos' directory usage."""
+    base = (name or "").strip().lower()
+    if not base:
+        base = "kryptos-job"
+    base = re.sub(r"[^a-z0-9._-]+", "-", base)
+    base = re.sub(r"-{2,}", "-", base).strip("-")
+    return base[:96] or "kryptos-job"
+
+
+def _default_job_name_from_url(url: str) -> str:
+    host = _domain(url) or "site"
+    host = host.replace(".", "-")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return _slug_job_name(f"kryptos-{host}-{stamp}")
+
+
+def _kryptos_headers() -> dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    token = os.environ.get("KRYPTOS_API_BEARER_TOKEN")
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def _is_text_blob(name: str, content_type: str | None) -> bool:
+    low = (name or "").lower()
+    if low.endswith(_GCS_TEXT_EXT):
+        return True
+    ct = (content_type or "").lower()
+    return ct.startswith("text/") or "json" in ct or "xml" in ct
+
+
+def _build_job_tree(
+    *,
+    files: list[dict[str, Any]],
+    prefix: str,
+    job_name: str,
+) -> dict[str, Any]:
+    """Build a directory-like tree for one Kryptos job prefix."""
+    root_path = (prefix or "").strip("/") + "/"
+    root: dict[str, Any] = {
+        "name": job_name,
+        "type": "directory",
+        "path": root_path,
+        "children": [],
+    }
+
+    def _get_or_make_dir(node: dict[str, Any], name: str, path: str) -> dict[str, Any]:
+        for c in node["children"]:
+            if c.get("type") == "directory" and c.get("name") == name:
+                return c
+        nxt = {"name": name, "type": "directory", "path": path, "children": []}
+        node["children"].append(nxt)
+        return nxt
+
+    sorted_files = sorted(files, key=lambda x: str(x.get("name", "")))
+    base = root_path
+    for f in sorted_files:
+        full = str(f.get("name") or "")
+        if not full:
+            continue
+        rel = full[len(base):] if full.startswith(base) else full
+        rel = rel.strip("/")
+        if not rel:
+            continue
+        parts = rel.split("/")
+        cur = root
+        cur_path = base
+        for p in parts[:-1]:
+            cur_path = f"{cur_path}{p}/"
+            cur = _get_or_make_dir(cur, p, cur_path)
+        leaf = {
+            "name": parts[-1],
+            "type": "file",
+            "path": full,
+            "size": f.get("size"),
+            "content_type": f.get("content_type"),
+            "updated": f.get("updated"),
+        }
+        cur["children"].append(leaf)
+    return root
+
+
+def _job_rel_paths(
+    *,
+    files: list[dict[str, Any]],
+    prefix: str,
+) -> list[str]:
+    """Return sorted relative object paths for a single job prefix."""
+    base = (prefix or "").strip("/") + "/"
+    rel_paths: list[str] = []
+    for f in sorted(files, key=lambda x: str(x.get("name", ""))):
+        full = str(f.get("name") or "")
+        if not full:
+            continue
+        rel = full[len(base):] if full.startswith(base) else full
+        rel = rel.strip("/")
+        if rel:
+            rel_paths.append(rel)
+    return rel_paths
+
+
+def _build_file_tree_text(job_name: str, rel_paths: list[str]) -> str:
+    """Compact text tree (names only) to reduce token usage."""
+    tree: dict[str, Any] = {"dirs": {}, "files": []}
+    for rel in rel_paths:
+        parts = [p for p in rel.split("/") if p]
+        if not parts:
+            continue
+        cur = tree
+        for d in parts[:-1]:
+            cur = cur["dirs"].setdefault(d, {"dirs": {}, "files": []})
+        cur["files"].append(parts[-1])
+
+    lines = [f"{job_name}/"]
+
+    def _render(node: dict[str, Any], indent: str) -> None:
+        for dname in sorted(node["dirs"]):
+            lines.append(f"{indent}{dname}/")
+            _render(node["dirs"][dname], indent + "  ")
+        for fname in sorted(node["files"]):
+            lines.append(f"{indent}{fname}")
+
+    _render(tree, "  ")
+    return "\n".join(lines)
+
+
+def _extract_last_event_text(progress_payload: Any) -> str | None:
+    """Best-effort extract of single-session summary text from progress payload."""
+    if not isinstance(progress_payload, dict):
+        return None
+    data = progress_payload.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    single = data.get("singleSession")
+    if isinstance(single, dict):
+        txt = single.get("lastEventText")
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+
+    txt2 = data.get("lastEventText")
+    if isinstance(txt2, str) and txt2.strip():
+        return txt2.strip()
+    return None
+
+
+def _normalize_rel_file_path(file_path: str, prefix: str) -> str:
+    raw = (file_path or "").strip().lstrip("/")
+    if not raw:
+        raise ValueError("file_path is required")
+    pref = (prefix or "").strip("/") + "/"
+    if raw.startswith(pref):
+        raw = raw[len(pref):].lstrip("/")
+    pp = PurePosixPath(raw)
+    if pp.is_absolute():
+        raise ValueError("file_path must be relative to the job prefix")
+    parts = [p for p in pp.parts if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError("file_path must not contain traversal segments")
+    return "/".join(parts)
+
+
+def _resolve_local_target(
+    *,
+    job_name: str,
+    rel_file_path: str,
+    local_dir: str | None,
+) -> Path:
+    base = local_dir or os.environ.get("KRYPTOS_LOCAL_FETCH_DIR") or os.path.join(
+        tempfile.gettempdir(), "browser-research-kryptos"
+    )
+    base_path = Path(base).expanduser().resolve()
+    target = (base_path / _slug_job_name(job_name) / Path(rel_file_path)).resolve()
+    if not str(target).startswith(str(base_path)):
+        raise ValueError("Resolved local file path escapes local_dir")
+    return target
+
+
+def _download_gcs_blob_to_local_sync(
+    *,
+    bucket: str,
+    blob_name: str,
+    local_path: Path,
+    overwrite: bool,
+) -> dict[str, Any] | None:
+    from google.cloud import storage
+
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(blob_name)
+    if not blob.exists(client):
+        return None
+    blob.reload(client=client)
+    if local_path.exists() and not overwrite:
+        raise FileExistsError(f"Local file exists: {local_path}")
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(str(local_path))
+    size = int(getattr(blob, "size", 0) or 0)
+    return {
+        "size": size,
+        "content_type": getattr(blob, "content_type", None),
+        "updated": (
+            blob.updated.isoformat()
+            if getattr(blob, "updated", None) is not None
+            else None
+        ),
+    }
+
+
+async def fetch_kryptos_job_file(
+    job_name: str,
+    file_path: str,
+    *,
+    bucket: str = _KRYPTOS_DEFAULT_BUCKET,
+    prefix_root: str = _KRYPTOS_DEFAULT_PREFIX_ROOT,
+    local_dir: str | None = None,
+    overwrite: bool = True,
+    wait_for_file: bool = True,
+    wait_timeout_s: int = 420,
+    poll_interval_s: int = 15,
+) -> dict[str, Any]:
+    """Fetch one file from a Kryptos job and save locally for tool reuse."""
+    t0 = time.perf_counter()
+    job = _slug_job_name(job_name)
+    root = (prefix_root or "").strip("/")
+    prefix = f"{root}/{job}/" if root else f"{job}/"
+    try:
+        rel_file = _normalize_rel_file_path(file_path, prefix)
+        local_path = _resolve_local_target(job_name=job, rel_file_path=rel_file, local_dir=local_dir)
+    except ValueError as e:
+        return {"error": str(e), "error_kind": "bad_request", "job_name": job}
+
+    blob_name = f"{prefix}{rel_file}"
+    deadline = time.monotonic() + max(0, int(wait_timeout_s))
+    polls = 0
+    waited = 0
+
+    while True:
+        polls += 1
+        try:
+            meta = await asyncio.to_thread(
+                _download_gcs_blob_to_local_sync,
+                bucket=bucket,
+                blob_name=blob_name,
+                local_path=local_path,
+                overwrite=overwrite,
+            )
+        except FileExistsError as e:
+            return {
+                "error": str(e),
+                "error_kind": "local_file_exists",
+                "job_name": job,
+                "file_path": rel_file,
+                "local_path": str(local_path),
+            }
+        except Exception as e:  # noqa: BLE001
+            _emit("fetch_kryptos_job_file", t0, extra={"err": "gcs", "polls": polls})
+            return {
+                "error": f"GCS file fetch failed: {e}",
+                "error_kind": "gcs_error",
+                "job_name": job,
+                "file_path": rel_file,
+                "gcs_uri": f"gs://{bucket}/{blob_name}",
+            }
+
+        if meta is not None:
+            out = {
+                "kind": "kryptos_job_file",
+                "job_name": job,
+                "file_path": rel_file,
+                "gcs_uri": f"gs://{bucket}/{blob_name}",
+                "local_path": str(local_path),
+                "waited_seconds": waited,
+                "polls": polls,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+            out.update(meta)
+            _emit("fetch_kryptos_job_file", t0, extra={"ok": 1, "polls": polls})
+            return out
+
+        if not wait_for_file:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        sleep_s = max(2, min(int(poll_interval_s), int(deadline - now)))
+        await asyncio.sleep(sleep_s)
+        waited += sleep_s
+
+    _emit("fetch_kryptos_job_file", t0, extra={"ok": 0, "polls": polls})
+    return {
+        "error": "File not found under job prefix yet.",
+        "error_kind": "not_found",
+        "job_name": job,
+        "file_path": rel_file,
+        "gcs_uri": f"gs://{bucket}/{blob_name}",
+        "waited_seconds": waited,
+        "polls": polls,
+    }
+
+
+async def wait_kryptos_job_completion(
+    job_id: str,
+    *,
+    job_name: str | None = None,
+    api_base_url: str | None = None,
+    poll_interval_s: int = _KRYPTOS_PROGRESS_POLL_S,
+    wait_timeout_s: int = 1800,
+    bucket: str = _KRYPTOS_DEFAULT_BUCKET,
+    prefix_root: str = _KRYPTOS_DEFAULT_PREFIX_ROOT,
+    gcs_wait_timeout_s: int = 60,
+    max_files: int = 50,
+    include_content: bool = False,
+    max_content_bytes: int = 200_000,
+) -> dict[str, Any]:
+    """Poll Kryptos job progress until terminal, then wait briefly for GCS sync.
+
+    Polls:
+      GET /api/progress/{jobId}
+    every `poll_interval_s` (default 10s) until status is terminal:
+      completed | failed | cancelled
+    Then polls GCS for up to `gcs_wait_timeout_s` (default 60s) to absorb sync lag.
+    """
+    t0 = time.perf_counter()
+    if not job_id:
+        return {"error": "job_id is required", "error_kind": "bad_request"}
+
+    base = (api_base_url or os.environ.get("KRYPTOS_API_BASE_URL")
+            or _KRYPTOS_DEFAULT_BASE_URL).rstrip("/")
+    headers = _kryptos_headers()
+    interval = max(2, int(poll_interval_s))
+    deadline = time.monotonic() + max(0, int(wait_timeout_s))
+    terminal = {"completed", "failed", "cancelled"}
+    polls = 0
+    waited = 0
+    last_payload: Any = None
+    final_status = "unknown"
+    last_event_text: str | None = None
+    completed_rechecks = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            while True:
+                polls += 1
+                r = await client.get(f"{base}/api/progress/{job_id}", headers=headers)
+                try:
+                    payload = r.json()
+                except Exception:  # noqa: BLE001
+                    payload = {"raw": r.text[:1000]}
+                last_payload = payload
+                if r.status_code >= 400:
+                    _emit("wait_kryptos_job_completion", t0, extra={"err": "progress_http"})
+                    return {
+                        "error": f"Kryptos progress poll failed HTTP {r.status_code}",
+                        "error_kind": "kryptos_progress_http_error",
+                        "http_status": r.status_code,
+                        "job_id": job_id,
+                        "api_base_url": base,
+                        "progress_response": payload,
+                    }
+                data = payload.get("data") if isinstance(payload, dict) else None
+                status = (data or {}).get("status") if isinstance(data, dict) else None
+                maybe_event_text = _extract_last_event_text(payload)
+                if maybe_event_text:
+                    last_event_text = maybe_event_text
+                if isinstance(status, str):
+                    final_status = status.strip().lower()
+                else:
+                    final_status = "unknown"
+                if final_status in terminal:
+                    if final_status == "completed" and not last_event_text and completed_rechecks < 3:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            break
+                        sleep_s = max(1, min(3, int(deadline - now)))
+                        await asyncio.sleep(sleep_s)
+                        waited += sleep_s
+                        completed_rechecks += 1
+                        continue
+                    break
+                now = time.monotonic()
+                if now >= deadline:
+                    final_status = "timeout"
+                    break
+                sleep_s = min(interval, int(deadline - now))
+                if sleep_s <= 0:
+                    final_status = "timeout"
+                    break
+                await asyncio.sleep(sleep_s)
+                waited += sleep_s
+    except httpx.HTTPError as e:
+        _emit("wait_kryptos_job_completion", t0, extra={"err": "transport"})
+        return {
+            "error": f"Kryptos progress request failed: {e}",
+            "error_kind": "kryptos_transport_error",
+            "job_id": job_id,
+            "api_base_url": base,
+        }
+
+    fetched: dict[str, Any] | None = None
+    normalized_job = _slug_job_name(job_name or "")
+    if normalized_job:
+        fetched = await fetch_kryptos_job_data(
+            normalized_job,
+            bucket=bucket,
+            prefix_root=prefix_root,
+            wait_for_files=True,
+            wait_timeout_s=max(0, int(gcs_wait_timeout_s)),
+            poll_interval_s=5,
+            max_files=max_files,
+            include_content=include_content,
+            max_content_bytes=max_content_bytes,
+        )
+
+    out = {
+        "kind": "kryptos_job_wait",
+        "job_id": job_id,
+        "job_name": normalized_job or None,
+        "status": final_status,
+        "terminal": final_status in terminal,
+        "polls": polls,
+        "waited_seconds": waited,
+        "progress_response": last_payload,
+        "api_base_url": base,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if last_event_text:
+        out["last_event_text"] = last_event_text
+    if fetched is not None:
+        out["gcs_result"] = fetched
+    if final_status == "timeout":
+        out["note"] = (
+            "Progress polling timed out before terminal status. "
+            "Retry rescue_wait with a larger wait_timeout_s."
+        )
+    _emit("wait_kryptos_job_completion", t0, extra={
+        "status": final_status,
+        "polls": polls,
+        "has_gcs": fetched is not None,
+    })
+    return out
+
+
+def _list_gcs_objects_sync(
+    *,
+    bucket: str,
+    prefix: str,
+    max_files: int,
+    include_content: bool,
+    max_content_bytes: int,
+) -> list[dict[str, Any]]:
+    from google.cloud import storage
+
+    client = storage.Client()
+    blobs = list(client.list_blobs(bucket, prefix=prefix, max_results=max_files))
+    out: list[dict[str, Any]] = []
+    for b in blobs:
+        if b.name.endswith("/"):
+            continue
+        item: dict[str, Any] = {
+            "name": b.name,
+            "gcs_uri": f"gs://{bucket}/{b.name}",
+            "size": int(getattr(b, "size", 0) or 0),
+            "content_type": getattr(b, "content_type", None),
+            "updated": (
+                b.updated.isoformat()
+                if getattr(b, "updated", None) is not None
+                else None
+            ),
+        }
+        if (include_content and item["size"] <= max_content_bytes
+                and _is_text_blob(b.name, item["content_type"])):
+            try:
+                raw = b.download_as_bytes()
+                text = raw.decode("utf-8", errors="replace")
+                item["content"] = text[:max_content_bytes]
+                item["content_truncated"] = len(text.encode("utf-8")) > max_content_bytes
+            except Exception as e:  # noqa: BLE001
+                item["content_error"] = str(e)[:200]
+        out.append(item)
+        if len(out) >= max_files:
+            break
+    return out
+
+
+async def fetch_kryptos_job_data(
+    job_name: str,
+    *,
+    bucket: str = _KRYPTOS_DEFAULT_BUCKET,
+    prefix_root: str = _KRYPTOS_DEFAULT_PREFIX_ROOT,
+    wait_for_files: bool = True,
+    wait_timeout_s: int = 420,
+    poll_interval_s: int = 15,
+    max_files: int = 50,
+    include_content: bool = True,
+    max_content_bytes: int = 200_000,
+) -> dict[str, Any]:
+    """Fetch files produced by a Kryptos single-URL job from GCS.
+
+    Files are expected at:
+      gs://<bucket>/<prefix_root>/<job_name>/
+    """
+    t0 = time.perf_counter()
+    job = _slug_job_name(job_name)
+    root = (prefix_root or "").strip("/")
+    prefix = f"{root}/{job}/" if root else f"{job}/"
+    deadline = time.monotonic() + max(0, int(wait_timeout_s))
+    polls = 0
+    waited = 0
+    files: list[dict[str, Any]] = []
+
+    while True:
+        polls += 1
+        try:
+            files = await asyncio.to_thread(
+                _list_gcs_objects_sync,
+                bucket=bucket,
+                prefix=prefix,
+                max_files=max(1, int(max_files)),
+                include_content=include_content,
+                max_content_bytes=max(1, int(max_content_bytes)),
+            )
+        except Exception as e:  # noqa: BLE001
+            _emit("fetch_kryptos_job_data", t0, extra={"err": "gcs", "polls": polls})
+            return {
+                "error": f"GCS fetch failed: {e}",
+                "error_kind": "gcs_error",
+                "job_name": job,
+                "bucket": bucket,
+                "prefix": prefix,
+            }
+        if files or not wait_for_files:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        sleep_s = max(2, min(int(poll_interval_s), int(deadline - now)))
+        await asyncio.sleep(sleep_s)
+        waited += sleep_s
+
+    out = {
+        "kind": "kryptos_job_data",
+        "job_name": job,
+        "bucket": bucket,
+        "prefix": prefix,
+        "ready": bool(files),
+        "waited_seconds": waited,
+        "polls": polls,
+        "file_count": len(files),
+        "files": files,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not files:
+        out["note"] = (
+            "No files found yet. Kryptos sync to GCS can take ~1-5 minutes. "
+            "Retry fetch_kryptos_job_data with a longer wait_timeout_s."
+        )
+    _emit("fetch_kryptos_job_data", t0, extra={"ready": bool(files), "files": len(files)})
+    return out
+
+
+async def external_extract_fallback(
+    url: str,
+    extraction_prompt: str,
+    *,
+    job_name: str | None = None,
+    description: str = "",
+    api_base_url: str | None = None,
+    start_job: bool = True,
+    bucket: str = _KRYPTOS_DEFAULT_BUCKET,
+    prefix_root: str = _KRYPTOS_DEFAULT_PREFIX_ROOT,
+    wait_for_completion: bool = True,
+    progress_wait_timeout_s: int = 900,
+    progress_poll_interval_s: int = _KRYPTOS_PROGRESS_POLL_S,
+    gcs_wait_timeout_s: int = 60,
+    max_files: int = 50,
+    include_content: bool = False,
+    max_content_bytes: int = 200_000,
+) -> dict[str, Any]:
+    """Last-resort fallback: run a Kryptos single-URL extraction job, then
+    fetch produced artifacts from GCS.
+
+    Workflow used:
+      1) POST /api/jobs
+      2) POST /api/jobs/{jobId}/start
+      3) GET /api/progress/{jobId} every ~10s until terminal
+      4) Poll GCS for up to ~60s for sync lag
+    """
+    t0 = time.perf_counter()
+    if not url:
+        return {"error": "url is required", "error_kind": "bad_request"}
+    if not extraction_prompt:
+        return {"error": "extraction_prompt is required", "error_kind": "bad_request"}
+
+    base = (api_base_url or os.environ.get("KRYPTOS_API_BASE_URL")
+            or _KRYPTOS_DEFAULT_BASE_URL).rstrip("/")
+    job = _slug_job_name(job_name or _default_job_name_from_url(url))
+    create_payload = {
+        "name": job,
+        "description": description or f"External fallback for {url}",
+        "config": {
+            "startUrls": [url],
+            "urlMode": "single",
+            "extractionPrompt": extraction_prompt,
+        },
+    }
+    headers = _kryptos_headers()
+
+    create_data: Any = None
+    start_data: Any = None
+    job_id: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            cr = await client.post(f"{base}/api/jobs", json=create_payload, headers=headers)
+            try:
+                create_data = cr.json()
+            except Exception:  # noqa: BLE001
+                create_data = {"raw": cr.text[:1000]}
+            if cr.status_code >= 400:
+                _emit("external_extract_fallback", t0, extra={"err": "create_http"})
+                return {
+                    "error": f"Kryptos create job failed HTTP {cr.status_code}",
+                    "error_kind": "kryptos_create_http_error",
+                    "http_status": cr.status_code,
+                    "response": create_data,
+                    "job_name": job,
+                    "url": url,
+                    "api_base_url": base,
+                }
+            if not isinstance(create_data, dict) or not create_data.get("success"):
+                _emit("external_extract_fallback", t0, extra={"err": "create_fail"})
+                return {
+                    "error": "Kryptos create job returned success=false",
+                    "error_kind": "kryptos_create_error",
+                    "response": create_data,
+                    "job_name": job,
+                    "url": url,
+                    "api_base_url": base,
+                }
+            job_id = (((create_data.get("data") or {}).get("id"))
+                      if isinstance(create_data.get("data"), dict) else None)
+            if not job_id:
+                return {
+                    "error": "Kryptos create job response missing data.id",
+                    "error_kind": "kryptos_create_malformed",
+                    "response": create_data,
+                    "job_name": job,
+                    "url": url,
+                    "api_base_url": base,
+                }
+
+            if start_job:
+                sr = await client.post(f"{base}/api/jobs/{job_id}/start", headers=headers)
+                try:
+                    start_data = sr.json()
+                except Exception:  # noqa: BLE001
+                    start_data = {"raw": sr.text[:1000]}
+                if sr.status_code >= 400:
+                    return {
+                        "error": f"Kryptos start job failed HTTP {sr.status_code}",
+                        "error_kind": "kryptos_start_http_error",
+                        "http_status": sr.status_code,
+                        "job_id": job_id,
+                        "job_name": job,
+                        "response": start_data,
+                        "url": url,
+                        "api_base_url": base,
+                    }
+    except httpx.HTTPError as e:
+        _emit("external_extract_fallback", t0, extra={"err": "transport"})
+        return {
+            "error": f"Kryptos API request failed: {e}",
+            "error_kind": "kryptos_transport_error",
+            "job_name": job,
+            "url": url,
+            "api_base_url": base,
+        }
+
+    if wait_for_completion and job_id:
+        fetched = await wait_kryptos_job_completion(
+            job_id,
+            job_name=job,
+            api_base_url=base,
+            poll_interval_s=progress_poll_interval_s,
+            wait_timeout_s=progress_wait_timeout_s,
+            bucket=bucket,
+            prefix_root=prefix_root,
+            gcs_wait_timeout_s=gcs_wait_timeout_s,
+            max_files=max_files,
+            include_content=include_content,
+            max_content_bytes=max_content_bytes,
+        )
+    else:
+        fetched = await fetch_kryptos_job_data(
+            job,
+            bucket=bucket,
+            prefix_root=prefix_root,
+            wait_for_files=True,
+            wait_timeout_s=max(0, int(gcs_wait_timeout_s)),
+            poll_interval_s=5,
+            max_files=max_files,
+            include_content=include_content,
+            max_content_bytes=max_content_bytes,
+        )
+
+    # external fallback should return only tree metadata (lightweight); content
+    # retrieval is intentionally delegated to rescue_fetch().
+    if isinstance(fetched, dict) and fetched.get("kind") == "kryptos_job_wait":
+        gcs_payload = fetched.get("gcs_result") if isinstance(fetched.get("gcs_result"), dict) else {}
+        status = fetched.get("status")
+        last_event_text = (
+            fetched.get("last_event_text")
+            if isinstance(fetched.get("last_event_text"), str)
+            else None
+        )
+    else:
+        gcs_payload = fetched if isinstance(fetched, dict) else {}
+        status = (fetched or {}).get("status") if isinstance(fetched, dict) else None
+        last_event_text = None
+
+    files_meta = gcs_payload.get("files") if isinstance(gcs_payload, dict) else None
+    files_meta = files_meta if isinstance(files_meta, list) else []
+    resolved_prefix = (gcs_payload.get("prefix")
+                       if isinstance(gcs_payload, dict) else None) or (
+        f"{prefix_root.strip('/')}/{job}/"
+    )
+    rel_files = _job_rel_paths(files=files_meta, prefix=resolved_prefix)
+    files_tree = _build_file_tree_text(job, rel_files)
+    out = {
+        "kind": "external_fallback",
+        "source": "kryptos_single_url",
+        "url": url,
+        "job_name": job,
+        "job_id": job_id,
+        "status": status,
+        "file_count": len(rel_files),
+        "files": rel_files,
+        "files_tree": files_tree,
+        "next_step": (
+            "Call rescue_fetch(job_name=..., file_path=...) to download one file locally."
+        ),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if last_event_text:
+        out["last_event_text"] = last_event_text
+    _emit("external_extract_fallback", t0, extra={
+        "job": job,
+        "status": status,
+        "files": len(files_meta),
+    })
     return out
