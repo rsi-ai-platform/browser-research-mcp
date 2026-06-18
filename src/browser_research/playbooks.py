@@ -376,6 +376,9 @@ def validate_playbooks(obj: Any) -> tuple[bool, str]:
                                    "object or null")
         if "proxy" in e and not isinstance(e["proxy"], bool):
             return False, f"entry {i}: proxy must be a boolean"
+        if ("prefer_rescue" in e
+                and not isinstance(e["prefer_rescue"], bool)):
+            return False, f"entry {i}: prefer_rescue must be a boolean"
         if not any(e.get(k) for k in
                    ("strategy", "avoid", "open_data", "act_steps", "api",
                     "proxy")):
@@ -435,5 +438,5 @@ def for_agent(entry: dict[str, Any]) -> dict[str, Any]:
     """The agent-facing projection injected into tool results."""
     return {k: entry[k] for k in
             ("id", "strategy", "avoid", "open_data", "act_steps", "api",
-             "proxy", "last_verified")
+             "proxy", "prefer_rescue", "last_verified")
             if k in entry}

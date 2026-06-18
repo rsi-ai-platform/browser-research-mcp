@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -43,28 +48,204 @@ async def _resolve_proxy(url: str, explicit: bool | None) -> bool:
     if explicit is not None:
         return explicit
     try:
-        pb = await playbooks.match_for_url(url)
+        pb = await _match_playbook(url)
         return bool(pb and pb.get("proxy"))
     except Exception as e:  # noqa: BLE001
         log.debug("proxy resolve failed: %s", e)
         return False
 
 
-async def _attach_playbook(result: dict[str, Any], url: str,
-                           tool: str = "") -> dict[str, Any]:
+async def _match_playbook(url: str) -> dict[str, Any] | None:
+    if not url:
+        return None
+    try:
+        return await playbooks.match_for_url(url)
+    except Exception as e:  # noqa: BLE001
+        log.debug("playbook lookup failed: %s", e)
+        return None
+
+
+def _strategy_was_from_playbook(
+    tool: str,
+    result: dict[str, Any],
+    playbook_entry: dict[str, Any] | None,
+    *,
+    url: str,
+) -> bool:
+    """Whether this successful run already followed an existing playbook recipe."""
+    if not isinstance(playbook_entry, dict):
+        return False
+
+    if tool == "smart_fetch":
+        return (
+            result.get("playbook_id") == playbook_entry.get("id")
+            and str(result.get("rung_used", "")).lower() in {"api", "open_data"}
+        )
+
+    if tool == "call_api":
+        for rec in (playbook_entry.get("api") or []):
+            if isinstance(rec, dict) and str(rec.get("endpoint") or "") == url:
+                return True
+        return False
+
+    if tool == "download_file":
+        for rec in (playbook_entry.get("open_data") or []):
+            if not isinstance(rec, dict):
+                continue
+            rec_tool = str(rec.get("tool") or "download_file")
+            if rec_tool == "download_file" and str(rec.get("url") or "") == url:
+                return True
+        return False
+
+    return False
+
+
+async def _attach_playbook(
+    result: dict[str, Any],
+    url: str,
+    tool: str = "",
+    *,
+    matched_playbook: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """If `url` matches a domain playbook, ride the recipe along in the result
     so the agent gets it on its FIRST call — no exploration. Also attach the
     `next_step` advisor. Best-effort: neither lookup may break a tool call."""
     try:
         if isinstance(result, dict):
-            pb = await playbooks.match_for_url(url)
+            pb = matched_playbook or await _match_playbook(url)
             if pb:
                 result.setdefault("playbook", playbooks.for_agent(pb))
     except Exception as e:  # noqa: BLE001
         log.debug("playbook attach failed: %s", e)
     if tool:
         _attach_next_step(result, tool)
+    await _save_success_strategy(
+        url, tool, result, matched_playbook=matched_playbook)
     return result
+
+
+def _domain(url: str) -> str:
+    try:
+        net = urlparse(url).netloc.lower()
+        return net[4:] if net.startswith("www.") else net
+    except Exception:
+        return ""
+
+
+def _strategy_for_success(tool: str, result: dict[str, Any]) -> str | None:
+    rung = str(result.get("rung_used", "")).strip().lower()
+    if tool == "smart_fetch":
+        if rung == "api":
+            return ("Prefer API replay (`call_api`) for this site; it is more "
+                    "reliable than driving custom JS widgets.")
+        if rung == "open_data":
+            return ("Use the playbook's `open_data` attachment/source first, "
+                    "then parse with `download_file`.")
+        if rung == "render":
+            return ("No executable API/open-data recipe matched; use rendered "
+                    "browser extraction for this site.")
+    if tool == "download_file":
+        return ("Published attachments are the primary data source on this "
+                "site; prefer `download_file` over page rendering.")
+    if tool == "call_api":
+        return ("Replay this site's data endpoint with `call_api` from the "
+                "page origin instead of brittle UI interactions.")
+    if tool == "rescue_extract":
+        return ("When native browser/API/file rungs fail, run "
+                "`rescue_extract` as the final fallback path.")
+    return None
+
+
+def _result_is_success(result: dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return False
+    # Bot walls and login gates are not successful retrievals.
+    if result.get("blocked") or result.get("auth_wall"):
+        return False
+    return True
+
+
+def _playbook_prefers_rescue(entry: dict[str, Any] | None) -> bool:
+    return bool(isinstance(entry, dict) and entry.get("prefer_rescue") is True)
+
+
+def _upsert_api_recipe(entry: dict[str, Any], endpoint: str,
+                       params: dict[str, Any] | None = None) -> None:
+    if not endpoint:
+        return
+    api = entry.get("api")
+    if not isinstance(api, list):
+        api = []
+        entry["api"] = api
+    for rec in api:
+        if isinstance(rec, dict) and rec.get("endpoint") == endpoint:
+            if params and rec.get("params") is None:
+                rec["params"] = params
+            return
+    api.append({
+        "endpoint": endpoint,
+        "method": "POST",
+        "params": params if isinstance(params, dict) else None,
+        "note": "Auto-captured from a successful run.",
+    })
+
+
+async def _save_success_strategy(
+    url: str,
+    tool: str,
+    result: dict[str, Any],
+    *,
+    matched_playbook: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort playbook learning: persist successful strategy/rung."""
+    if not tool or not _result_is_success(result):
+        return
+    pb = matched_playbook
+    if pb is None:
+        pb = await _match_playbook(url)
+    if _strategy_was_from_playbook(tool, result, pb, url=url):
+        return
+    strategy = _strategy_for_success(tool, result)
+    if not strategy:
+        return
+    dom = _domain(url)
+    if not dom:
+        return
+    try:
+        entries = await playbooks.get_playbooks(force=True)
+        # Clone shallowly so we do not mutate cache objects in-place.
+        updated: list[dict[str, Any]] = [
+            dict(e) if isinstance(e, dict) else e for e in entries
+        ]
+        matched = playbooks.match_playbook(updated, url)
+        if not isinstance(matched, dict):
+            matched = {
+                "id": f"auto-{dom}",
+                "match": {"domain": dom},
+            }
+            updated.append(matched)
+        matched["strategy"] = strategy
+        matched["last_verified"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if tool == "rescue_extract":
+            matched["prefer_rescue"] = True
+        elif tool == "smart_fetch":
+            # A normal smart_fetch success means native rungs worked;
+            # do not keep forcing rescue-first.
+            matched["prefer_rescue"] = False
+
+        if tool == "smart_fetch" and result.get("rung_used") == "api":
+            _upsert_api_recipe(
+                matched,
+                str(result.get("api_endpoint") or ""),
+                result.get("api_params")
+                if isinstance(result.get("api_params"), dict)
+                else None,
+            )
+        await playbooks.save_playbooks(updated)
+    except Exception as e:  # noqa: BLE001
+        log.debug("playbook strategy save failed: %s", e)
 
 
 mcp = FastMCP(
@@ -109,6 +290,35 @@ mcp = FastMCP(
         "  - `smart_fetch(url, focus)`: playbook-AWARE one-call fetch — consults "
         "    the URL's playbook and ACTS on it (replays its `api`, pulls its "
         "    `open_data`, else renders). Prefer it when a site may have a recipe.\n\n"
+        "  - `rescue_extract(url, extraction_prompt, ...)`: LAST-RUNG rescue. "
+        "    Use only after native rungs fail (blocked/auth_wall/no-progress). "
+        "    Creates + starts a Kryptos single-URL job, waits for completion, "
+        "    and returns ONLY compact file names + text tree for that job.\n"
+        "  - `rescue_fetch(job_name, file_path, ...)`: download exactly one file "
+        "    from an existing Kryptos job (data/<job_name>/...) to local disk, "
+        "    then use normal file tools on that local path."
+        "\n"
+        "  - `rescue_wait(job_id, job_name, ...)`: poll progress "
+        "    (`/api/progress/{jobId}`) every 10s until terminal (completed/"
+        "failed/cancelled), then poll GCS up to ~60s for sync lag."
+        "\n\n"
+        "FLOW (LEVELS) — prefer this order unless a playbook already gives a "
+        "direct recipe:\n"
+        "  - Level 0 (anchor): `today` for time grounding, `strategy` when you "
+        "need a decision refresher.\n"
+        "  - Level 1 (cheap discovery): `sitemap_probe` then `visit` to map the "
+        "site and detect whether content is page text, API-fed, or file links.\n"
+        "  - Level 2 (UI interaction): `act` for dropdown/tab/button flows when "
+        "the data is behind interaction.\n"
+        "  - Level 3 (API path): `inspect_network` to discover XHR/fetch calls, "
+        "then `call_api` to replay the endpoint directly.\n"
+        "  - Level 4 (playbook-aware one-call): `smart_fetch` to execute "
+        "playbook recipes (`api`/`open_data`) or render fallback.\n"
+        "  - Level 5 (file-as-data): `download_file` for .xlsx/.xls/.csv/.tsv/"
+        ".pdf surfaced by `visit`/`act`/`sitemap_probe`.\n"
+        "  - Level 6 (rescue): `rescue_extract` whenever normal levels are "
+        "blocked/no-progress; use `rescue_wait` to track completion and "
+        "`rescue_fetch` to pull a specific artifact.\n\n"
         "API-REPLAY PATTERN — your sharpest tool for JS-dropdown dashboards "
         "(PPAC, RBI, NSE, MoSPI). When a Year/Month/State selector is a custom "
         "JS widget (so `act`'s select/click time out) the table is really fed "
@@ -159,6 +369,39 @@ mcp = FastMCP(
         "true to force the residential proxy (BROWSER_PROXY_* env) on a "
         "`blocked` retry — a datacenter egress IP is the usual cause of an "
         "enterprise-CDN wall.\n\n"
+        "ESCALATION RULE (STANDARD): if Levels 1-5 (`visit`/`act`/"
+        "`inspect_network`/`call_api`/`smart_fetch`/`download_file`) still "
+        "cannot produce the requested data (e.g. repeated `blocked`, "
+        "`auth_wall`, widget dead-end, stale/no data), escalate to "
+        "`rescue_extract` before concluding failure. If the rescue job is "
+        "already known, call `rescue_fetch` directly; for in-flight jobs, use "
+        "`rescue_wait`.\n\n"
+        "AKAMAI RULE: always try normal rungs first (visit/act/inspect_network/"
+        "call_api/download_file). If the page is blocked by Akamai (e.g. "
+        "'Access Denied', challenge page, or repeated `blocked` on this domain), "
+        "switch to rescue mode (`rescue_extract`) instead of retrying normal "
+        "browser actions.\n\n"
+        "FILTER FAILURE RULE: when required filters/selectors/widgets (date, "
+        "ministry, language, state, year/month/day) are not accessible, not "
+        "stable, or do not change results as expected after a reasonable try, "
+        "STOP iterating URL/query/filter permutations and jump to rescue mode "
+        "(`rescue_extract`). Do not brute-force all possible combinations.\n\n"
+        "RESCUE IS INDEPENDENT: `rescue_extract` is not tied to `smart_fetch` — "
+        "you may call it directly from any flow (`visit`, `act`, "
+        "`inspect_network`, `call_api`) when normal rungs are not producing the "
+        "target data.\n\n"
+        "ANTI-THRASH GUARDRAILS:\n"
+        "  - If 1-2 filter attempts fail (selector timeout, no-op submit, same "
+        "listing/content despite changed filters), escalate to `rescue_extract`.\n"
+        "  - If a result shows challenge/block symptoms (`blocked`, "
+        "`fallback_reason=challenge_title`, 'Access Denied', recurring 404/500 "
+        "error-page text), escalate to rescue; do NOT continue URL guessing.\n"
+        "  - If `inspect_network` returns no useful API evidence "
+        "(request_count=0 or no relevant requests) after a targeted attempt, "
+        "escalate to rescue rather than trying many alternate URL patterns.\n"
+        "  - If consecutive calls return low-signal pages (navigation shell, "
+        "same title/text pattern, wrong-language generic listing), treat as "
+        "no-progress and escalate to rescue.\n\n"
         + strategy_module.STRATEGY_INSTRUCTIONS
     ),
 )
@@ -297,6 +540,7 @@ async def visit(
          fetched_at, current_date}
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.visit(
         url,
         wait_for_selector=wait_for_selector,
@@ -306,9 +550,12 @@ async def visit(
         full_page_screenshot=full_page_screenshot,
         text_cap=text_cap,
         return_screenshot_b64=return_screenshot_b64,
-        use_proxy=await _resolve_proxy(url, use_proxy),
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="visit")
+    return await _attach_playbook(
+        result, url, tool="visit", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -380,14 +627,18 @@ async def act(
          final_url, kind: "browser"}.
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.act(
         url, steps,
         focus=focus,
         timeout_ms=timeout_ms,
         full_page_screenshot=full_page_screenshot,
-        use_proxy=await _resolve_proxy(url, use_proxy),
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="act")
+    return await _attach_playbook(
+        result, url, tool="act", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -418,14 +669,18 @@ async def extract(
          dates[], tables_summary[], kind: "browser"}.
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.extract(
         url,
         focus=focus,
         wait_for_selector=wait_for_selector,
         full_page_screenshot=full_page_screenshot,
-        use_proxy=await _resolve_proxy(url, use_proxy),
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="extract")
+    return await _attach_playbook(
+        result, url, tool="extract", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -472,6 +727,7 @@ async def download_file(
             invalid_xlsx, parse_error, wrong_content_type, too_large}.
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.download_file(
         url,
         sheet=sheet,
@@ -480,9 +736,12 @@ async def download_file(
         max_pdf_pages=max_pdf_pages,
         query=query,
         max_matches=max_matches,
-        use_proxy=await _resolve_proxy(url, use_proxy),
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="download_file")
+    return await _attach_playbook(
+        result, url, tool="download_file", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -513,11 +772,15 @@ async def sitemap_probe(
          sitemaps_fetched[], url_count, data_like_urls[], urls[], notes, hint?}
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.sitemap_probe(
         url, max_urls=max_urls, max_sitemaps=max_sitemaps,
-        use_proxy=await _resolve_proxy(url, use_proxy),
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="sitemap_probe")
+    return await _attach_playbook(
+        result, url, tool="sitemap_probe", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -559,11 +822,16 @@ async def inspect_network(
          response_sample, ...}], step_results?}
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
     result = await tools.inspect_network(
         url, steps=steps, settle_ms=settle_ms, url_filter=url_filter,
-        timeout_ms=timeout_ms, use_proxy=await _resolve_proxy(url, use_proxy),
+        timeout_ms=timeout_ms,
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
-    return await _attach_playbook(result, url, tool="inspect_network")
+    return await _attach_playbook(
+        result, url, tool="inspect_network", matched_playbook=pb)
 
 
 @mcp.tool()
@@ -606,17 +874,32 @@ async def call_api(
          source: "browser_api"}.
     """
     _bind(ctx)
-    return await tools.call_api(
+    pb = await _match_playbook(page_url or url)
+    result = await tools.call_api(
         url, method=method, body=body, headers=headers, page_url=page_url,
         content_type=content_type,
-        use_proxy=await _resolve_proxy(page_url or url, use_proxy),
+        use_proxy=await _resolve_proxy(page_url or url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
     )
+    return await _attach_playbook(
+        result, url, tool="call_api", matched_playbook=pb)
 
 
 @mcp.tool()
 async def smart_fetch(
     url: str,
     focus: str = "",
+    allow_fallback: bool = True,
+    fallback_extraction_prompt: str | None = None,
+    fallback_api_base_url: str | None = None,
+    fallback_wait_for_completion: bool = True,
+    fallback_progress_wait_timeout_s: int = 900,
+    fallback_progress_poll_interval_s: int = 10,
+    fallback_gcs_wait_timeout_s: int = 60,
+    fallback_max_files: int = 50,
+    fallback_include_content: bool = False,
+    fallback_max_content_bytes: int = 200000,
     use_proxy: bool | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -640,14 +923,206 @@ async def smart_fetch(
             recipes, e.g. "natural gas consumption FY2023-24").
     """
     _bind(ctx)
+    pb = await _match_playbook(url)
+    if allow_fallback:
+        if _playbook_prefers_rescue(pb):
+            rescue = await tools.external_extract_fallback(
+                url,
+                fallback_extraction_prompt or focus or
+                "Extract the requested facts and figures from this page.",
+                api_base_url=fallback_api_base_url,
+                wait_for_completion=fallback_wait_for_completion,
+                progress_wait_timeout_s=fallback_progress_wait_timeout_s,
+                progress_poll_interval_s=fallback_progress_poll_interval_s,
+                gcs_wait_timeout_s=fallback_gcs_wait_timeout_s,
+                max_files=fallback_max_files,
+                include_content=fallback_include_content,
+                max_content_bytes=fallback_max_content_bytes,
+            )
+            if isinstance(rescue, dict) and not rescue.get("error"):
+                rescue["fallback_used"] = "rescue_extract"
+                rescue["rescue_short_circuit"] = True
+                return await _attach_playbook(
+                    rescue, url, tool="rescue_extract", matched_playbook=pb)
     result = await tools.smart_fetch(
-        url, focus=focus, use_proxy=await _resolve_proxy(url, use_proxy))
-    return await _attach_playbook(result, url, tool="smart_fetch")
+        url, focus=focus,
+        use_proxy=await _resolve_proxy(url, use_proxy) if pb is None else (
+            use_proxy if use_proxy is not None else bool(pb.get("proxy"))
+        ),
+    )
+    if (
+        allow_fallback
+        and isinstance(result, dict)
+        and (result.get("error") or result.get("blocked") or result.get("auth_wall"))
+    ):
+        rescue = await tools.external_extract_fallback(
+            url,
+            fallback_extraction_prompt or focus or
+            "Extract the requested facts and figures from this page.",
+            api_base_url=fallback_api_base_url,
+            wait_for_completion=fallback_wait_for_completion,
+            progress_wait_timeout_s=fallback_progress_wait_timeout_s,
+            progress_poll_interval_s=fallback_progress_poll_interval_s,
+            gcs_wait_timeout_s=fallback_gcs_wait_timeout_s,
+            max_files=fallback_max_files,
+            include_content=fallback_include_content,
+            max_content_bytes=fallback_max_content_bytes,
+        )
+        if isinstance(rescue, dict) and not rescue.get("error"):
+            rescue["fallback_used"] = "rescue_extract"
+            return await _attach_playbook(
+                rescue, url, tool="rescue_extract", matched_playbook=pb)
+    return await _attach_playbook(
+        result, url, tool="smart_fetch", matched_playbook=pb)
+
+
+@mcp.tool()
+async def rescue_extract(
+    url: str,
+    extraction_prompt: str,
+    job_name: str | None = None,
+    description: str = "",
+    api_base_url: str | None = None,
+    start_job: bool = True,
+    bucket: str = "single-url-data",
+    prefix_root: str = "data",
+    wait_for_completion: bool = True,
+    progress_wait_timeout_s: int = 900,
+    progress_poll_interval_s: int = 10,
+    gcs_wait_timeout_s: int = 60,
+    max_files: int = 50,
+    include_content: bool = False,
+    max_content_bytes: int = 200000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Final-rung rescue extraction when native strategies fail.
+
+    Use this when browser/API/file-based rungs cannot yield the target data:
+    - repeated `blocked` / CDN wall
+    - `auth_wall` / login gate
+    - brittle JS controls with no replayable endpoint
+    - source page reachable but required period/data remains unavailable
+
+    Executes Kryptos single-URL flow:
+      POST /api/jobs
+      POST /api/jobs/{jobId}/start
+      GET /api/progress/{jobId} (poll every ~10s until terminal)
+    then reads synced artifacts from:
+      gs://<bucket>/<prefix_root>/<job_name>/
+
+    Cron scheduling is intentionally ignored here; this tool is a one-shot
+    operational rescue path.
+
+    Returns metadata only: compact file names + a text tree for this job,
+    plus `last_event_text` when Kryptos reports single-session summary text.
+    To retrieve a specific artifact, call
+    `rescue_fetch(job_name=..., file_path=...)`.
+    """
+    _bind(ctx)
+    pb = await _match_playbook(url)
+    result = await tools.external_extract_fallback(
+        url,
+        extraction_prompt,
+        job_name=job_name,
+        description=description,
+        api_base_url=api_base_url,
+        start_job=start_job,
+        bucket=bucket,
+        prefix_root=prefix_root,
+        wait_for_completion=wait_for_completion,
+        progress_wait_timeout_s=progress_wait_timeout_s,
+        progress_poll_interval_s=progress_poll_interval_s,
+        gcs_wait_timeout_s=gcs_wait_timeout_s,
+        max_files=max_files,
+        include_content=include_content,
+        max_content_bytes=max_content_bytes,
+    )
+    return await _attach_playbook(
+        result, url, tool="rescue_extract", matched_playbook=pb)
+
+
+@mcp.tool()
+async def rescue_fetch(
+    job_name: str,
+    file_path: str,
+    bucket: str = "single-url-data",
+    prefix_root: str = "data",
+    local_dir: str | None = None,
+    overwrite: bool = True,
+    wait_for_file: bool = True,
+    wait_timeout_s: int = 420,
+    poll_interval_s: int = 15,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Fetch one file for an existing rescue extraction job from GCS.
+
+    Expected object prefix:
+      gs://<bucket>/<prefix_root>/<job_name>/
+
+    Use this when:
+    - you already know the target artifact path under a rescue job
+    - you want that single artifact downloaded locally for follow-up tools
+    """
+    _bind(ctx)
+    return await tools.fetch_kryptos_job_file(
+        job_name,
+        file_path,
+        bucket=bucket,
+        prefix_root=prefix_root,
+        local_dir=local_dir,
+        overwrite=overwrite,
+        wait_for_file=wait_for_file,
+        wait_timeout_s=wait_timeout_s,
+        poll_interval_s=poll_interval_s,
+    )
+
+
+@mcp.tool()
+async def rescue_wait(
+    job_id: str,
+    job_name: str | None = None,
+    api_base_url: str | None = None,
+    poll_interval_s: int = 10,
+    wait_timeout_s: int = 900,
+    bucket: str = "single-url-data",
+    prefix_root: str = "data",
+    gcs_wait_timeout_s: int = 60,
+    max_files: int = 50,
+    include_content: bool = True,
+    max_content_bytes: int = 200000,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Wait for a rescue extraction job to complete, then fetch synced files.
+
+    Polls Kryptos:
+      GET /api/progress/{jobId}
+    every `poll_interval_s` (default 10s) until status is terminal
+    (completed/failed/cancelled), then polls GCS up to `gcs_wait_timeout_s`
+    (default 60s) to absorb post-completion sync lag.
+
+    Default is metadata-only. Includes `last_event_text` when present.
+    Use `rescue_fetch` for file contents.
+    """
+    _bind(ctx)
+    return await tools.wait_kryptos_job_completion(
+        job_id,
+        job_name=job_name,
+        api_base_url=api_base_url,
+        poll_interval_s=poll_interval_s,
+        wait_timeout_s=wait_timeout_s,
+        bucket=bucket,
+        prefix_root=prefix_root,
+        gcs_wait_timeout_s=gcs_wait_timeout_s,
+        max_files=max_files,
+        include_content=include_content,
+        max_content_bytes=max_content_bytes,
+    )
 
 
 # ============================================================================
 # Admin API — read/edit playbooks WITHOUT a redeploy (the platform's admin-
-# settings UI calls these). Token-gated via ADMIN_TOKEN, fail-closed if unset.
+# settings UI calls these). If ADMIN_TOKEN is set, requests must include
+# X-Admin-Token. If ADMIN_TOKEN is unset, admin auth is disabled (fail-open).
 # Routes exist only on HTTP transports and only if this FastMCP build supports
 # custom_route; otherwise edit the GCS object directly (still hot-reloaded).
 # Recommended: have the platform BACKEND proxy these server-to-server so the
@@ -656,11 +1131,300 @@ async def smart_fetch(
 
 if hasattr(mcp, "custom_route"):
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import HTMLResponse, JSONResponse
 
     def _admin_ok(request: Request) -> bool:
-        token = os.environ.get("ADMIN_TOKEN")
-        return bool(token) and request.headers.get("X-Admin-Token") == token
+        token = (os.environ.get("ADMIN_TOKEN") or "").strip()
+        if not token:
+            return True
+        return request.headers.get("X-Admin-Token") == token
+
+    async def _save_entries(entries: Any) -> tuple[bool, str]:
+        ok, err = playbooks.validate_playbooks(entries)
+        if not ok:
+            return False, err
+        try:
+            await playbooks.save_playbooks(entries)
+        except Exception as e:  # noqa: BLE001
+            return False, f"save failed: {e}"
+        return True, ""
+
+    def _admin_ui_html() -> str:
+        return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Browser Research Admin</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #fafafa; color: #222; }
+    h1 { margin-top: 0; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .tabs { display: flex; gap: 8px; margin: 8px 0 12px; }
+    .tabs button { padding: 8px 12px; cursor: pointer; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    input, textarea, select { width: 100%; padding: 8px; box-sizing: border-box; }
+    textarea { min-height: 120px; font-family: Consolas, monospace; }
+    pre { background: #111; color: #e5e5e5; padding: 10px; overflow: auto; white-space: pre-wrap; }
+    .muted { color: #666; font-size: 12px; }
+    .ok { color: #0a7a2f; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Browser Research Admin</h1>
+  <div class="card">
+    <div class="row">
+      <div style="min-width: 320px; flex: 1;">
+        <label>Admin token (sent as X-Admin-Token)</label>
+        <input id="token" type="password" placeholder="ADMIN_TOKEN" />
+      </div>
+    </div>
+    <div class="tabs">
+      <button onclick="showTab('agent')">Agent Test</button>
+      <button onclick="showTab('playbooks')">Playbook Strategies</button>
+    </div>
+  </div>
+
+  <div id="tab-agent" class="tab active card">
+    <h3>Agent Test (script runner)</h3>
+    <div class="row">
+      <div style="flex: 2; min-width: 360px;">
+        <label>Query</label>
+        <textarea id="agent-query">Extract the pib releases from PIB website for PM office for 13th June 2025 and summarize each</textarea>
+      </div>
+      <div style="flex: 1; min-width: 220px;">
+        <label>Model (optional)</label>
+        <input id="agent-model" placeholder="claude-sonnet-4-6" />
+        <label style="margin-top: 8px; display:block;">Max iterations</label>
+        <input id="agent-max-iters" type="number" min="1" max="60" value="12" />
+        <label style="margin-top: 8px; display:block;">Timeout seconds</label>
+        <input id="agent-timeout" type="number" min="30" max="3600" value="900" />
+      </div>
+    </div>
+    <div class="row">
+      <button onclick="runAgentTest()">Run Agent Test</button>
+      <span id="agent-status" class="muted"></span>
+    </div>
+    <pre id="agent-output">(no output yet)</pre>
+  </div>
+
+  <div id="tab-playbooks" class="tab card">
+    <h3>Playbook Strategies</h3>
+    <div class="row">
+      <button onclick="loadPlaybooks()">Load Playbooks</button>
+      <button onclick="saveAllPlaybooks()">Save All (bulk JSON)</button>
+      <span id="pb-status" class="muted"></span>
+    </div>
+    <label>Bulk JSON editor (GET/PUT /admin/playbooks)</label>
+    <textarea id="pb-json"></textarea>
+
+    <hr />
+    <h4>Upsert Strategy (quick edit)</h4>
+    <div class="row">
+      <div style="flex: 1; min-width: 240px;">
+        <label>Playbook id (optional)</label>
+        <input id="pb-id" placeholder="pib-allrel" />
+      </div>
+      <div style="flex: 2; min-width: 280px;">
+        <label>URL (optional, used to match/create by domain)</label>
+        <input id="pb-url" placeholder="https://pib.gov.in/allRel.aspx" />
+      </div>
+      <div style="min-width: 160px;">
+        <label><input id="pb-prefer-rescue" type="checkbox" /> prefer_rescue</label>
+      </div>
+    </div>
+    <label>Strategy text</label>
+    <textarea id="pb-strategy"></textarea>
+    <div class="row">
+      <button onclick="upsertStrategy()">Upsert Strategy</button>
+    </div>
+
+    <hr />
+    <h4>Add/Delete Entries</h4>
+    <label>Add entry JSON (single playbook object)</label>
+    <textarea id="pb-add-json" placeholder='{"id":"my-playbook","match":{"domain":"example.com"},"strategy":"..."}'></textarea>
+    <div class="row">
+      <button onclick="addEntry()">Add Entry</button>
+      <input id="pb-delete-id" placeholder="playbook id to delete" style="max-width: 260px;" />
+      <button onclick="deleteEntry()">Delete Entry By ID</button>
+    </div>
+  </div>
+
+  <script>
+    function tokenHeader() {
+      const token = document.getElementById("token").value.trim();
+      return token ? { "X-Admin-Token": token } : {};
+    }
+    function showTab(name) {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.getElementById("tab-" + name).classList.add("active");
+    }
+    async function api(url, options = {}) {
+      const headers = Object.assign(
+        { "Content-Type": "application/json" },
+        tokenHeader(),
+        options.headers || {}
+      );
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      const text = await res.text();
+      let body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
+      if (!res.ok) throw new Error((body && (body.error || body.raw)) || ("HTTP " + res.status));
+      return body;
+    }
+    function setStatus(id, msg, ok) {
+      const el = document.getElementById(id);
+      el.textContent = msg;
+      el.className = ok ? "ok" : "err";
+    }
+    async function runAgentTest() {
+      const out = document.getElementById("agent-output");
+      out.textContent = "Running...";
+      setStatus("agent-status", "", true);
+      try {
+        const body = {
+          query: document.getElementById("agent-query").value,
+          model: document.getElementById("agent-model").value || null,
+          max_iters: Number(document.getElementById("agent-max-iters").value || 12),
+          timeout_s: Number(document.getElementById("agent-timeout").value || 900)
+        };
+        const res = await api("/admin/agent-test", { method: "POST", body: JSON.stringify(body) });
+        out.textContent = res.stdout || "(no stdout)";
+        if (res.stderr) out.textContent += "\\n\\n[stderr]\\n" + res.stderr;
+        setStatus("agent-status", "completed (exit " + String(res.exit_code) + ")", res.ok === true);
+      } catch (e) {
+        out.textContent = String(e);
+        setStatus("agent-status", String(e), false);
+      }
+    }
+    async function loadPlaybooks() {
+      try {
+        const res = await api("/admin/playbooks");
+        document.getElementById("pb-json").value = JSON.stringify(res.playbooks || [], null, 2);
+        setStatus("pb-status", "loaded " + String((res.playbooks || []).length) + " entries", true);
+      } catch (e) {
+        setStatus("pb-status", String(e), false);
+      }
+    }
+    async function saveAllPlaybooks() {
+      try {
+        const parsed = JSON.parse(document.getElementById("pb-json").value || "[]");
+        const res = await api("/admin/playbooks", { method: "PUT", body: JSON.stringify({ playbooks: parsed }) });
+        setStatus("pb-status", "saved " + String(res.count || 0) + " entries", true);
+      } catch (e) {
+        setStatus("pb-status", String(e), false);
+      }
+    }
+    async function upsertStrategy() {
+      try {
+        const body = {
+          id: document.getElementById("pb-id").value || null,
+          url: document.getElementById("pb-url").value || null,
+          strategy: document.getElementById("pb-strategy").value,
+          prefer_rescue: document.getElementById("pb-prefer-rescue").checked
+        };
+        const res = await api("/admin/playbooks/strategy", { method: "POST", body: JSON.stringify(body) });
+        setStatus("pb-status", "strategy saved for " + String((res.entry || {}).id || ""), true);
+        await loadPlaybooks();
+      } catch (e) {
+        setStatus("pb-status", String(e), false);
+      }
+    }
+    async function addEntry() {
+      try {
+        const entry = JSON.parse(document.getElementById("pb-add-json").value);
+        const res = await api("/admin/playbooks/entry", { method: "POST", body: JSON.stringify(entry) });
+        setStatus("pb-status", "entry added, count " + String(res.count || 0), true);
+        await loadPlaybooks();
+      } catch (e) {
+        setStatus("pb-status", String(e), false);
+      }
+    }
+    async function deleteEntry() {
+      try {
+        const id = document.getElementById("pb-delete-id").value.trim();
+        if (!id) throw new Error("delete id required");
+        const res = await api("/admin/playbooks/entry/" + encodeURIComponent(id), { method: "DELETE" });
+        setStatus("pb-status", "entry deleted, count " + String(res.count || 0), true);
+        await loadPlaybooks();
+      } catch (e) {
+        setStatus("pb-status", String(e), false);
+      }
+    }
+  </script>
+</body>
+</html>"""
+
+    @mcp.custom_route("/admin/ui", methods=["GET"])
+    async def _admin_ui(_request: Request):
+        return HTMLResponse(_admin_ui_html())
+
+    @mcp.custom_route("/admin/agent-test", methods=["POST"])
+    async def _admin_agent_test(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        query = str((body or {}).get("query") or "").strip()
+        if not query:
+            return JSONResponse({"error": "query is required"}, status_code=422)
+        model = str((body or {}).get("model") or "").strip()
+        max_iters = int((body or {}).get("max_iters") or 8)
+        timeout_s = int((body or {}).get("timeout_s") or 900)
+        max_iters = max(1, min(60, max_iters))
+        timeout_s = max(30, min(3600, timeout_s))
+
+        root = Path(__file__).resolve().parents[2]
+        script = root / "scripts" / "test_agent_sonnet.py"
+        if not script.exists():
+            return JSONResponse(
+                {"error": f"script not found: {script}"},
+                status_code=500,
+            )
+        cmd = [
+            sys.executable,
+            str(script),
+            "--max-iters",
+            str(max_iters),
+            "--query",
+            query,
+            "--print-assistant-text",
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()  # type: ignore[name-defined]
+            except Exception:
+                pass
+            return JSONResponse({"error": "agent test timed out"}, status_code=504)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": f"agent test failed: {e}"}, status_code=500)
+        stdout = (stdout_b or b"").decode("utf-8", errors="replace")
+        stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+        return JSONResponse({
+            "ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "command": cmd,
+        })
 
     @mcp.custom_route("/admin/playbooks", methods=["GET"])
     async def _admin_get_playbooks(request: Request):
@@ -680,14 +1444,97 @@ if hasattr(mcp, "custom_route"):
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         entries = body.get("playbooks") if isinstance(body, dict) else body
-        ok, err = playbooks.validate_playbooks(entries)
+        ok, err = await _save_entries(entries)
         if not ok:
             return JSONResponse({"error": err}, status_code=422)
-        try:
-            await playbooks.save_playbooks(entries)
-        except Exception as e:  # noqa: BLE001
-            return JSONResponse({"error": f"save failed: {e}"}, status_code=502)
         return JSONResponse({"ok": True, "count": len(entries)})
+
+    @mcp.custom_route("/admin/playbooks/entry", methods=["POST"])
+    async def _admin_add_playbook_entry(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            entry = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(entry, dict):
+            return JSONResponse({"error": "entry must be an object"}, status_code=422)
+        entries = await playbooks.get_playbooks(force=True)
+        out = [dict(e) if isinstance(e, dict) else e for e in entries]
+        if entry.get("id"):
+            for idx, e in enumerate(out):
+                if isinstance(e, dict) and e.get("id") == entry.get("id"):
+                    return JSONResponse({"error": "id already exists"}, status_code=409)
+        out.append(entry)
+        ok, err = await _save_entries(out)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=422)
+        return JSONResponse({"ok": True, "count": len(out)})
+
+    @mcp.custom_route("/admin/playbooks/entry/{playbook_id}", methods=["DELETE"])
+    async def _admin_delete_playbook_entry(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        pid = str(request.path_params.get("playbook_id") or "").strip()
+        if not pid:
+            return JSONResponse({"error": "playbook_id is required"}, status_code=422)
+        entries = await playbooks.get_playbooks(force=True)
+        out = [dict(e) if isinstance(e, dict) else e for e in entries]
+        kept = [e for e in out if not (isinstance(e, dict) and e.get("id") == pid)]
+        if len(kept) == len(out):
+            return JSONResponse({"error": "playbook id not found"}, status_code=404)
+        ok, err = await _save_entries(kept)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=422)
+        return JSONResponse({"ok": True, "count": len(kept)})
+
+    @mcp.custom_route("/admin/playbooks/strategy", methods=["POST"])
+    async def _admin_upsert_strategy(request: Request):
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=422)
+        strategy = str(body.get("strategy") or "").strip()
+        if not strategy:
+            return JSONResponse({"error": "strategy is required"}, status_code=422)
+        prefer_rescue = body.get("prefer_rescue")
+        if prefer_rescue is not None and not isinstance(prefer_rescue, bool):
+            return JSONResponse({"error": "prefer_rescue must be boolean"}, status_code=422)
+        pid = str(body.get("id") or "").strip()
+        url = str(body.get("url") or "").strip()
+
+        entries = await playbooks.get_playbooks(force=True)
+        out = [dict(e) if isinstance(e, dict) else e for e in entries]
+        target: dict[str, Any] | None = None
+        if pid:
+            for e in out:
+                if isinstance(e, dict) and e.get("id") == pid:
+                    target = e
+                    break
+        if target is None and url:
+            target = playbooks.match_playbook(out, url)
+        if target is None:
+            dom = _domain(url)
+            if not dom:
+                return JSONResponse(
+                    {"error": "provide either existing id or a URL with domain"},
+                    status_code=422,
+                )
+            new_id = pid or f"auto-{dom}"
+            target = {"id": new_id, "match": {"domain": dom}}
+            out.append(target)
+        target["strategy"] = strategy
+        target["last_verified"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if prefer_rescue is not None:
+            target["prefer_rescue"] = prefer_rescue
+        ok, err = await _save_entries(out)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=422)
+        return JSONResponse({"ok": True, "entry": target, "count": len(out)})
 
     @mcp.custom_route("/admin/playbooks/validate", methods=["POST"])
     async def _admin_validate(request: Request):
