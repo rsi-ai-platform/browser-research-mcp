@@ -1,0 +1,19 @@
+# Internal LoadBalancer for nlx-browser. VIP 10.10.0.34:8080, reachable only from
+# inside the VPC (nlx-fetch dials it via the in-cluster DNS name
+# nlx-browser.nlx.svc.cluster.local:8080). NOT exposed to the internet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nlx-browser
+  namespace: nlx
+  annotations:
+    networking.gke.io/load-balancer-type: Internal
+spec:
+  type: LoadBalancer
+  selector:
+    app: nlx-browser
+  ports:
+    - name: mcp
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

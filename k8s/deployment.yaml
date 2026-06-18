@@ -1,0 +1,56 @@
+# nlx-browser — the browser-research MCP (headless-Chromium browser tier of the
+# NLX fetch ladder). Runs on the `rsi-workspaces` GKE Autopilot cluster, namespace
+# `nlx`. nlx-fetch (authority-web-search) escalates to it via the internal Service.
+#
+# This file is the REFERENCE / disaster-recovery spec. Day-to-day, CI
+# (.github/workflows/deploy-gke.yml) only rolls the image tag via
+# `kubectl set image` — everything else here is preserved on the live object.
+# To re-create from scratch: kubectl apply -f k8s/  (then CI rolls the image).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nlx-browser
+  namespace: nlx
+  labels:
+    app: nlx-browser
+    tier: nlx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nlx-browser
+  template:
+    metadata:
+      labels:
+        app: nlx-browser
+        tier: nlx
+    spec:
+      serviceAccountName: nlx-fetch          # Workload-Identity SA shared with nlx-fetch
+      containers:
+        - name: nlx-browser
+          # CI rolls this tag to the pushed git SHA. `:latest` is the apply-time floor.
+          image: asia-south1-docker.pkg.dev/silverfox-454313/agentic-rag/browser-research-mcp:latest
+          ports:
+            - name: mcp
+              containerPort: 8080
+          env:
+            - { name: MCP_TRANSPORT, value: streamable-http }
+            - { name: MCP_HOST, value: 0.0.0.0 }
+            - { name: PORT, value: "8080" }
+            - { name: FORWARDED_ALLOW_IPS, value: "*" }
+            - { name: HEADLESS, value: "true" }
+            - { name: MCP_AUTH_REQUIRED, value: "true" }            # HybridAuth: id-token (no static bearer)
+            - { name: MCP_ALLOWED_SA_EMAILS, value: 800435094335-compute@developer.gserviceaccount.com }
+            - { name: PLAYBOOKS_GCS_BUCKET, value: browser-research-mcp-config }
+            - { name: SERVICE_URL, value: http://10.10.0.34:8080 }  # internal LB VIP (id-token audience)
+          resources:                          # headless Chromium is hungry; Autopilot pins req==lim
+            requests: { cpu: "4", memory: 6Gi, ephemeral-storage: 1Gi }
+            limits:   { cpu: "4", memory: 6Gi, ephemeral-storage: 1Gi }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 40
+            periodSeconds: 20

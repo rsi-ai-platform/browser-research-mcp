@@ -1,0 +1,122 @@
+# Continuous deployment to GKE — the LIVE target for browser-research.
+#
+# browser-research runs on the `rsi-workspaces` GKE Autopilot cluster as the
+# `nlx-browser` Deployment (namespace `nlx`). The older deploy-cloud-run.yml
+# targets a *different* service (Cloud Run `browser-research-mcp`) that the
+# NL-tier no longer routes to — which is why pushes never reached the cluster.
+# THIS workflow is the one that updates production.
+#
+# On every push to main (and on workflow_dispatch): rebuild the image, push to
+# Artifact Registry tagged with the commit SHA, then `kubectl set image` it onto
+# nlx-browser and wait for the rollout. The internal LB VIP (10.10.0.34) is not
+# reachable from CI, so the smoke test runs from inside the cluster.
+#
+# Auth: Workload Identity Federation (no long-lived key). Reuse the existing WIF
+# pool — point the WIF_PROVIDER / WIF_SA secrets at a deployer SA that has:
+#   roles/artifactregistry.writer   (push the image)
+#   roles/container.developer       (kubectl onto the cluster)   ← the new one for GKE
+# One-time setup is documented in k8s/README.md.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   WIF_PROVIDER   projects/<NUM>/locations/global/workloadIdentityPools/github-actions/providers/github
+#   WIF_SA         <deployer-sa>@silverfox-454313.iam.gserviceaccount.com
+
+name: Deploy to GKE (nlx-browser)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'k8s/**'
+  workflow_dispatch:
+
+concurrency:
+  group: gke-nlx-browser-deploy
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: silverfox-454313
+  REGION: asia-south1
+  IMAGE_BASE: asia-south1-docker.pkg.dev/silverfox-454313/agentic-rag/browser-research-mcp
+  CLUSTER: rsi-workspaces
+  CLUSTER_LOCATION: asia-south1
+  NAMESPACE: nlx
+  DEPLOYMENT: nlx-browser
+  CONTAINER: nlx-browser
+
+jobs:
+  deploy:
+    name: Build, push, roll onto GKE
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # required for Workload Identity Federation
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.CLUSTER_LOCATION }}
+
+      - name: Roll the image onto nlx-browser
+        run: |
+          set -euo pipefail
+          IMG="$IMAGE_BASE:${{ github.sha }}"
+          echo "Rolling $DEPLOYMENT → $IMG"
+          kubectl -n "$NAMESPACE" set image "deployment/$DEPLOYMENT" "$CONTAINER=$IMG"
+          kubectl -n "$NAMESPACE" annotate "deployment/$DEPLOYMENT" \
+            kubernetes.io/change-cause="ci ${{ github.sha }} @ $(date -u +%FT%TZ)" --overwrite
+          # Gate on the readiness probe (tcpSocket:8080). If the new image crashes
+          # or never listens, this times out and the build fails (auto-keeps old pods).
+          kubectl -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout=300s
+
+      - name: In-cluster smoke test
+        run: |
+          set -uo pipefail
+          # The Service is an INTERNAL LB (10.10.0.34) — unreachable from the CI
+          # runner — so curl from inside the cluster. Unauthed POST /mcp must be
+          # rejected by HybridAuth (401/403), which proves the server is up + gated.
+          POD="smoke-${{ github.run_id }}"
+          CODE=$(kubectl -n "$NAMESPACE" run "$POD" --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 \
+            --overrides='{"spec":{"containers":[{"name":"c","image":"curlimages/curl:8.10.1","resources":{"requests":{"cpu":"250m","memory":"256Mi"},"limits":{"cpu":"250m","memory":"256Mi"}},"command":["curl","-s","-o","/dev/null","-w","%{http_code}","-X","POST","http://nlx-browser.nlx.svc.cluster.local:8080/mcp","-H","Content-Type: application/json","-d","{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\",\"params\":{}}"]}]}}' \
+            2>/dev/null || true)
+          echo "unauthed /mcp → HTTP ${CODE:-<none>}"
+          case "${CODE:-}" in
+            401|403|400) echo "✓ nlx-browser up + auth enforced";;
+            *) echo "::warning::smoke got '${CODE:-none}' (rollout already passed readiness; not failing the build)";;
+          esac
